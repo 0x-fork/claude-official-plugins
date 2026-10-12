@@ -270,6 +270,10 @@ def emit_metrics(
     head = {}
     if _PV and "pv" not in metrics:
         head["pv"] = _PV
+    # sg-python.sh could only start this interpreter by its real path: the
+    # names on PATH were launcher aliases that cannot read the plugin files.
+    if os.environ.get("SG_LAUNCHER_FALLBACK") == "1":
+        head["launcher_fallback"] = 1
     head.update(_usage_metrics())
     if head:
         metrics = {**head, **metrics}

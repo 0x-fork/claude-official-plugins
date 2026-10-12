@@ -845,6 +845,10 @@ if __name__ == "__main__":
     pv = _plugin_version_int()
     if pv:
         metrics["pv"] = pv
+    # See sg-python.sh pass 4: started by real path, the PATH names could
+    # not read the plugin files.
+    if os.environ.get("SG_LAUNCHER_FALLBACK") == "1":
+        metrics["launcher_fallback"] = 1
     response: dict[str, object] = {"metrics": metrics}
     # One-time user-visible notice when the agentic reviewer is dead on
     # arrival. Uses hookSpecificOutput.additionalContext (SessionStart's

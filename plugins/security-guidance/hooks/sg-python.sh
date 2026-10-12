@@ -33,6 +33,10 @@ set -e
 # changing it from inside the interpreter has no effect.
 export PYTHONUTF8=1
 
+# Set to 1 below only when the interpreter had to be found by its real path
+# (pass 4); the hook reports it as the `launcher_fallback` metric.
+unset SG_LAUNCHER_FALLBACK
+
 # Git Bash / MSYS on Windows hands script paths to this shim in POSIX form
 # (`/c/Users/...`). When we exec a Windows `python.exe` (which we do on
 # Windows since `python3` is the Microsoft Store stub), python interprets the
@@ -173,6 +177,7 @@ for cmd in "python3" "python" "py -3"; do
     fi
     sg_candidates+=("$c")
 done
+export SG_LAUNCHER_FALLBACK=1
 sg_fallback=""
 sg_tried="|"
 for cmd in "${sg_candidates[@]}"; do
@@ -198,6 +203,8 @@ if [ -n "$sg_unreadable" ]; then
     echo "  hook script: $SG_TARGET" >&2
     echo "  on Windows this happens when python, python3 and py are Microsoft Store or Python Install Manager aliases;" >&2
     echo "  install Python from https://python.org and put it ahead of ...\\Microsoft\\WindowsApps in PATH" >&2
+    # No Python to report it, so the launcher emits the metric itself.
+    echo '{"metrics": {"launcher_unreadable": 1}}'
     exit 1
 fi
 echo "security-guidance: no working Python 3 interpreter found." >&2
