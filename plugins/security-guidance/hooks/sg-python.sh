@@ -45,14 +45,30 @@ unset SG_LAUNCHER_FALLBACK
 # fails with ENOENT, and every Edit/Write/MultiEdit tool use blocks until the
 # session restarts. See anthropics/claude-plugins-official#2043.
 #
-# Fix: convert absolute path args to native Windows form via `cygpath -w`
-# before exec. `cygpath` is a Git Bash builtin; it's absent on macOS/Linux,
-# where the `command -v` guard makes this a no-op. `cygpath -w` is idempotent
-# for already-Windows paths so the rare mixed-form case is safe.
+# Fix: convert absolute path args to native Windows form before exec.
+# `cygpath` ships with Git Bash; it's absent on macOS/Linux, where the
+# `command -v` guard makes this a no-op. `cygpath -w` is idempotent for
+# already-Windows paths so the rare mixed-form case is safe.
+#
+# Under Git Bash every $(...) is a new Windows process, and this shim runs on
+# every hook, so drive paths (`/c/Users/...`, where the plugin lives) are
+# converted in-shell. Git Bash and MSYS2 (OSTYPE=msys) mount drives at
+# /<letter>; anything else (`/tmp`, `/usr`, Cygwin's /cygdrive) needs cygpath
+# to resolve. See #6470.
 if command -v cygpath >/dev/null 2>&1; then
+    sg_drive_mounts=""
+    case "${OSTYPE:-}" in msys*) sg_drive_mounts=1 ;; esac
     converted=()
     for a in "$@"; do
         case "$a" in
+            /[A-Za-z]/*)
+                if [ -n "$sg_drive_mounts" ]; then
+                    drive="${a:1:1}"
+                    rest="${a:3}"
+                    converted+=("${drive^^}:\\${rest//\//\\}")
+                else
+                    converted+=("$(cygpath -w "$a")")
+                fi ;;
             /*) converted+=("$(cygpath -w "$a")") ;;
             *)  converted+=("$a") ;;
         esac
@@ -83,13 +99,24 @@ probe() {
     # [Errno 2]" and exit code 2 -- and exit 2 from an asyncRewake hook wakes
     # the model, whose reply runs the Stop hook again: an endless loop that
     # never reviewed anything. See #6251, #5781.
-    "$@" -c 'import os, sys; t = (sys.argv[1:] or [""])[0]; sys.exit(3) if t and not (os.path.isfile(t) and os.access(t, os.R_OK)) else print(f"{sys.version_info[0]}.{sys.version_info[1]}")' "$SG_TARGET" 2>/dev/null
+    #
+    # Only for `$(probe ...)`: the `exec` replaces that subshell instead of
+    # forking a second process from it.
+    [ "${BASH_SUBSHELL:-0}" -gt 0 ] || return 1
+    exec "$@" -c 'import os, sys; t = (sys.argv[1:] or [""])[0]; sys.exit(3) if t and not (os.path.isfile(t) and os.access(t, os.R_OK)) else print(f"{sys.version_info[0]}.{sys.version_info[1]}")' "$SG_TARGET" 2>/dev/null
 }
 
 # Use as `v=$(probe ...) || { note_unreadable "<name>"; continue; }`.
 note_unreadable() {
     [ $? -eq 3 ] && sg_unreadable="$sg_unreadable|$1|"
     return 0
+}
+
+# True iff the command's executable is on PATH ($1 of a possibly multi-word
+# command like `py -3`). A builtin lookup: `$(probe ...)` costs a process even
+# when the interpreter does not exist, so missing names are skipped first.
+on_path() {
+    command -v "$1" >/dev/null 2>&1
 }
 
 # True iff arg is a "M.m" version string >= 3.10. claude_agent_sdk requires
@@ -110,7 +137,9 @@ is_sdk_compatible() {
 # so picking one here always upgrades over the system `python3`. Highest
 # available wins; the user doesn't have to PATH-prefer it.
 for cmd in "python3.13" "python3.12" "python3.11" "python3.10"; do
+    on_path "$cmd" || continue
     v=$(probe "$cmd") || { note_unreadable "$cmd"; continue; }
+    v=${v%$'\r'}
     if is_sdk_compatible "$v"; then
         exec "$cmd" "$@"
     fi
@@ -119,13 +148,21 @@ done
 # Pass 2 — bare interpreters, but only if SDK-compatible. Covers Linux distros
 # that ship 3.10+ as the default `python3`, and Windows where `python` /
 # `py -3` resolves to the user's python.org install.
+sg_older=""  # first of these that is a readable Python 3 below 3.10
 for cmd in "python3" "python" "py -3"; do
     # shellcheck disable=SC2086
+    on_path $cmd || continue
+    # shellcheck disable=SC2086
     v=$(probe $cmd) || { note_unreadable "$cmd"; continue; }
+    v=${v%$'\r'}
     if is_sdk_compatible "$v"; then
         # shellcheck disable=SC2086
         exec $cmd "$@"
     fi
+    # Anything that successfully reported a "M.m" string.
+    case "$v" in
+        [0-9]*.[0-9]*) [ -n "$sg_older" ] || sg_older="$cmd" ;;
+    esac
 done
 
 # Pass 3 — fallback to any Python 3, even <3.10. Pattern-based checks
@@ -133,18 +170,10 @@ done
 # own; the SDK-dependent paths will detect the version mismatch and degrade
 # inside the Python code. Without this fallback, the entire plugin would
 # stop working on default macOS, which is a regression vs today.
-for cmd in "python3" "python" "py -3"; do
-    case "$sg_unreadable" in *"|$cmd|"*) continue ;; esac
+if [ -n "$sg_older" ]; then
     # shellcheck disable=SC2086
-    v=$(probe $cmd) || continue
-    # Accept anything that successfully reported a "M.m" string.
-    case "$v" in
-        [0-9]*.[0-9]*)
-            # shellcheck disable=SC2086
-            exec $cmd "$@"
-            ;;
-    esac
-done
+    exec $sg_older "$@"
+fi
 
 # Pass 4 — nothing above could run the hook script. If that is because the
 # names on PATH resolve to packaged launcher aliases that cannot see the
