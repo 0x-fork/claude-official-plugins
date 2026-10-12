@@ -56,10 +56,36 @@ if command -v cygpath >/dev/null 2>&1; then
     set -- "${converted[@]}"
 fi
 
+# The hook script the chosen interpreter has to run (already in native form).
+SG_TARGET=""
+case "${1:-}" in
+    ""|-*) ;;
+    *) SG_TARGET="$1" ;;
+esac
+
+# Names whose interpreter runs but cannot see the hook script ("|"-separated).
+sg_unreadable=""
+
 probe() {
     # $1..N: the interpreter command (may be multi-word like `py -3`)
-    # Writes "<major>.<minor>" to stdout and exits 0 iff at least Python 3.
-    "$@" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null
+    # Writes "<major>.<minor>" to stdout and exits 0 iff it is at least
+    # Python 3 AND it can read the hook script; exits 3 if it cannot.
+    #
+    # The second half matters on Windows: an interpreter started through a
+    # packaged launcher alias (Microsoft Store Python, Python Install Manager;
+    # the python/python3/py entries under ...\Microsoft\WindowsApps) runs with
+    # a different view of %APPDATA% than the process that started it. It
+    # answers `-c` fine, then fails on the script with "can't open file ...
+    # [Errno 2]" and exit code 2 -- and exit 2 from an asyncRewake hook wakes
+    # the model, whose reply runs the Stop hook again: an endless loop that
+    # never reviewed anything. See #6251, #5781.
+    "$@" -c 'import os, sys; t = (sys.argv[1:] or [""])[0]; sys.exit(3) if t and not (os.path.isfile(t) and os.access(t, os.R_OK)) else print(f"{sys.version_info[0]}.{sys.version_info[1]}")' "$SG_TARGET" 2>/dev/null
+}
+
+# Use as `v=$(probe ...) || { note_unreadable "<name>"; continue; }`.
+note_unreadable() {
+    [ $? -eq 3 ] && sg_unreadable="$sg_unreadable|$1|"
+    return 0
 }
 
 # True iff arg is a "M.m" version string >= 3.10. claude_agent_sdk requires
@@ -80,7 +106,7 @@ is_sdk_compatible() {
 # so picking one here always upgrades over the system `python3`. Highest
 # available wins; the user doesn't have to PATH-prefer it.
 for cmd in "python3.13" "python3.12" "python3.11" "python3.10"; do
-    v=$(probe "$cmd") || continue
+    v=$(probe "$cmd") || { note_unreadable "$cmd"; continue; }
     if is_sdk_compatible "$v"; then
         exec "$cmd" "$@"
     fi
@@ -91,7 +117,7 @@ done
 # `py -3` resolves to the user's python.org install.
 for cmd in "python3" "python" "py -3"; do
     # shellcheck disable=SC2086
-    v=$(probe $cmd) || continue
+    v=$(probe $cmd) || { note_unreadable "$cmd"; continue; }
     if is_sdk_compatible "$v"; then
         # shellcheck disable=SC2086
         exec $cmd "$@"
@@ -104,6 +130,7 @@ done
 # inside the Python code. Without this fallback, the entire plugin would
 # stop working on default macOS, which is a regression vs today.
 for cmd in "python3" "python" "py -3"; do
+    case "$sg_unreadable" in *"|$cmd|"*) continue ;; esac
     # shellcheck disable=SC2086
     v=$(probe $cmd) || continue
     # Accept anything that successfully reported a "M.m" string.
@@ -115,6 +142,64 @@ for cmd in "python3" "python" "py -3"; do
     esac
 done
 
+# Pass 4 — nothing above could run the hook script. If that is because the
+# names on PATH resolve to packaged launcher aliases that cannot see the
+# plugin directory (see probe), the same interpreter usually works when it is
+# started by its real path instead of through the alias. Candidates:
+#   - every further python3/python on PATH, by full path (a regular install
+#     often sits behind the alias in PATH order; the first match is the one
+#     the bare name resolved to above),
+#   - the real executable each alias reports as sys.executable.
+# The list is built before the loop that execs, and from a here-document: a
+# redirect around that loop would become the hook's stdin.
+sg_candidates=()
+for name in "python3" "python"; do
+    first=1
+    while IFS= read -r c; do
+        if [ -n "$first" ]; then first=""; continue; fi
+        [ -n "$c" ] && sg_candidates+=("$c")
+    done <<EOF
+$(type -ap "$name" 2>/dev/null)
+EOF
+done
+for cmd in "python3" "python" "py -3"; do
+    case "$sg_unreadable" in *"|$cmd|"*) ;; *) continue ;; esac
+    # shellcheck disable=SC2086
+    c=$($cmd -c 'import sys; print(sys.executable)' 2>/dev/null) || continue
+    c=${c%$'\r'}  # native Windows Python prints CRLF
+    [ -n "$c" ] || continue
+    if command -v cygpath >/dev/null 2>&1; then
+        c=$(cygpath -u "$c" 2>/dev/null) || continue
+    fi
+    sg_candidates+=("$c")
+done
+sg_fallback=""
+sg_tried="|"
+for cmd in "${sg_candidates[@]}"; do
+    case "$sg_tried" in *"|$cmd|"*) continue ;; esac
+    sg_tried="$sg_tried$cmd|"
+    v=$(probe "$cmd") || { note_unreadable "$cmd"; continue; }
+    v=${v%$'\r'}
+    if is_sdk_compatible "$v"; then
+        exec "$cmd" "$@"
+    fi
+    case "$v" in
+        [0-9]*.[0-9]*) [ -n "$sg_fallback" ] || sg_fallback="$cmd" ;;
+    esac
+done
+if [ -n "$sg_fallback" ]; then
+    exec "$sg_fallback" "$@"
+fi
+
+# Exit 1, never 2: on an asyncRewake hook exit 2 means "the review has
+# findings, wake the model", and a launcher failure is not a finding.
+if [ -n "$sg_unreadable" ]; then
+    echo "security-guidance: found Python, but it cannot read the hook script (missing, or not visible to Python), so no security checks ran." >&2
+    echo "  hook script: $SG_TARGET" >&2
+    echo "  on Windows this happens when python, python3 and py are Microsoft Store or Python Install Manager aliases;" >&2
+    echo "  install Python from https://python.org and put it ahead of ...\\Microsoft\\WindowsApps in PATH" >&2
+    exit 1
+fi
 echo "security-guidance: no working Python 3 interpreter found." >&2
 echo "  tried: python3.13, python3.12, python3.11, python3.10, python3, python, py -3" >&2
 echo "  on Windows, install Python from https://python.org (NOT the Microsoft Store)" >&2
