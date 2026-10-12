@@ -198,6 +198,37 @@ CONTINUATION_SUFFIX = (
     "response."
 )
 
+# Output fields that only Claude Code reads. Other hosts that run this plugin's
+# hooks can validate hook output against a closed schema and reject the whole
+# line over a field they do not know, which shows up as a hook error on every
+# turn.
+_CLAUDE_CODE_OUTPUT_FIELDS = ("metrics", "rewakeSummary")
+
+
+def _portable_output():
+    """True when stdout should carry only the standard hook output fields.
+
+    SECURITY_GUIDANCE_PORTABLE_OUTPUT=1 or =0 forces it on or off. Otherwise it
+    is on only when the host passes PLUGIN_ROOT and does not identify itself as
+    Claude Code, so Claude Code and direct invocations are unchanged."""
+    forced = os.environ.get("SECURITY_GUIDANCE_PORTABLE_OUTPUT", "").strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    if forced in ("0", "false", "no", "off"):
+        return False
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return False
+    return bool(os.environ.get("PLUGIN_ROOT"))
+
+
+def _write_hook_output(out):
+    """Print one hook output line. In portable mode the Claude Code only
+    fields are left out; what remains (possibly `{}`) is still valid output."""
+    if _portable_output():
+        out = {k: v for k, v in out.items() if k not in _CLAUDE_CODE_OUTPUT_FIELDS}
+    print(json.dumps(out), flush=True)
+
+
 def emit_metrics(
     metrics,
     rewake_summary=None,
@@ -296,7 +327,7 @@ def emit_metrics(
             }
     if system_message:
         out["systemMessage"] = system_message
-    print(json.dumps(out), flush=True)
+    _write_hook_output(out)
 
 # =====================================================================
 # State management
@@ -2335,7 +2366,7 @@ def main():
             # Another spawn for this same tool_use_id already claimed the
             # work (compound matched multiple `if` configs). Emit a single
             # metric so telemetry can count how often the de-dupe kicks in.
-            print(json.dumps({"metrics": {"bash_hook_dedup": True}}), flush=True)
+            _write_hook_output({"metrics": {"bash_hook_dedup": True}})
             sys.exit(0)
         if _GIT_COMMIT_RE.search(cmd):
             handle_commit_review_posttooluse(input_data)
@@ -2411,7 +2442,7 @@ def main():
                     "hookEventName": "PostToolUse",
                     "additionalContext": PROVENANCE_TAG + "\n\n" + "\n\n".join(all_guidance),
                 }
-            print(json.dumps(output))
+            _write_hook_output(output)
         elif all_guidance:
             # Defensive: pattern rules disabled but guidance somehow set (shouldn't happen)
             print(json.dumps({

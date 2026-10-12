@@ -58,6 +58,14 @@ SECURITY_REVIEW_MODEL=claude-opus-5-5
 | `ENABLE_STOP_REVIEW=0` | on | Disable only the Stop-hook diff review, keeping commit/push reviews. Useful for multi-agent / shared-worktree setups where another agent can move HEAD between a worker's turns |
 | `ENABLE_COMMIT_REVIEW=0` | on | Disable layer 3 (agentic commit review) |
 
+### Hook output for other hosts
+
+```bash
+SECURITY_GUIDANCE_PORTABLE_OUTPUT=1   # default: detected
+```
+
+The hooks' JSON output carries two fields that only Claude Code reads (`metrics` and `rewakeSummary`). A host that validates hook output against a closed schema rejects them. In portable mode they are left out and only the standard fields remain (`decision`, `reason`, `systemMessage`, `hookSpecificOutput`). It turns on by itself when the host passes `PLUGIN_ROOT` and does not identify itself as Claude Code; set the variable to `1` or `0` to force it either way.
+
 ### Higher-recall mode
 
 ```bash
