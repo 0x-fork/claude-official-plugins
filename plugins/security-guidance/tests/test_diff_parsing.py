@@ -87,3 +87,13 @@ class TestCommitOutput:
         )
         parsed = gitutil.parse_diff_into_files(r.stdout.decode())
         assert [p for p, _ in parsed] == ["app.py"]
+
+
+def test_unparsed_headers_are_counted_for_telemetry():
+    import gitutil
+    gitutil._unparsed_diff_headers.clear()
+    diff = 'diff --git "a/x.py b/x.py\n@@ -0,0 +1 @@\n+x = 1\n'
+    assert gitutil.parse_diff_into_files(diff) == []
+    assert gitutil.extract_file_paths_from_diff(diff) == []
+    assert len(gitutil._unparsed_diff_headers) == 1
+    gitutil._unparsed_diff_headers.clear()

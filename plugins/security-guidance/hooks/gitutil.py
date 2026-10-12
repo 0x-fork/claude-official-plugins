@@ -1030,6 +1030,12 @@ def _parse_diff_header(header):
     return old[2:], new[2:]
 
 
+# Section headers that could not be parsed during this hook run; that file is
+# left out of the review. The Stop hook reports the count so a header shape
+# this parser misses shows up in telemetry instead of passing silently.
+_unparsed_diff_headers = set()
+
+
 def _iter_diff_sections(diff_output):
     """Yield (new_path, lines after the header line) per file section."""
     for section in _DIFF_SECTION_RE.split(diff_output)[1:]:
@@ -1037,6 +1043,8 @@ def _iter_diff_sections(diff_output):
         paths = _parse_diff_header(lines[0])
         if paths:
             yield paths[1] or paths[0], lines[1:]
+        else:
+            _unparsed_diff_headers.add(lines[0])
 
 
 def extract_file_paths_from_diff(diff_output):

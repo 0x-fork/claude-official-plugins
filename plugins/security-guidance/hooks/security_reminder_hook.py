@@ -125,6 +125,7 @@ from reporesolve import (  # noqa: E402,F401
     toplevel_from_command, repo_containing_commit, scan_roots,
     resolve_repo_root, save_repo_hint, load_repo_hint,
 )
+import gitutil  # noqa: E402  module ref for per-run counters
 import llm  # noqa: E402  module ref for reassignable globals (_last_call_claude_http_error etc.)
 from llm import (  # noqa: E402,F401
     ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, HAS_API_CREDENTIALS,
@@ -1959,6 +1960,8 @@ def handle_stop_hook(input_data):
             "skipped": True, "skip_reason": reason, "fire_index": fire_count + 1,
             "diff_strategy_v2": True,
             **v2_metrics, **extra, **sweep,
+            **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
+               if gitutil._unparsed_diff_headers else {}),
         })
         sys.exit(0)
 
@@ -2174,6 +2177,8 @@ def handle_stop_hook(input_data):
                if llm._last_review_truncated_bytes else {}),
             **({"repo_resolution": repo_res} if res_metrics else {}),
             **sweep_trimmed,
+            **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
+               if gitutil._unparsed_diff_headers else {}),
         }, rewake_summary=_format_vulns_summary(vulns),
            additional_context=(PROVENANCE_BANNER + "\n\n"
                                + concrete_guidance + CONTINUATION_SUFFIX + "\n"),
@@ -2204,6 +2209,8 @@ def handle_stop_hook(input_data):
         **({"diff_truncated": llm._last_review_truncated_bytes}
            if llm._last_review_truncated_bytes else {}),
         **v2_metrics,
+        **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
+           if gitutil._unparsed_diff_headers else {}),
     })
     sys.exit(0)
 
