@@ -204,9 +204,15 @@ class TestRegexes:
     def test_push_re(self, cmd):
         assert hook._GIT_PUSH_RE.search(cmd)
 
-    @pytest.mark.parametrize("cmd", ["git status", "git log --oneline", "echo commit"])
+    @pytest.mark.parametrize("cmd", ["git status", "git log --oneline", "echo commit",
+                                     "git commit-graph write --reachable", "git commit-tree HEAD^{tree}",
+                                     "git log --grep commit", "git stash push"])
     def test_commit_re_negative(self, cmd):
         assert not hook._GIT_COMMIT_RE.search(cmd)
+
+    @pytest.mark.parametrize("cmd", ["git stash push", "git log --grep push", "git commit-graph write"])
+    def test_push_re_negative(self, cmd):
+        assert not hook._GIT_PUSH_RE.search(cmd)
 
     @pytest.mark.parametrize("unit", ['-c "a"', "-c 'a'", "--no-a=b", "--a=b=c=d", "--git-dir x"])
     @pytest.mark.parametrize("regex,verb", [("_GIT_COMMIT_RE", "commit"), ("_GIT_PUSH_RE", "push")])
@@ -228,11 +234,19 @@ class TestHooksJson:
         assert stop["command"].endswith('security_reminder_hook.py"')
         assert stop["asyncRewake"] is True
         bash = [g for g in cfg["hooks"]["PostToolUse"] if g.get("matcher") == "Bash"][0]
-        ifs = {h.get("if") for h in bash["hooks"]}
-        assert {"Bash(git commit:*)", "Bash(git push:*)", "Bash(git -C * commit *)",
-                "Bash(git -C * push*)", "Bash(gt create:*)", "Bash(gt modify:*)",
-                "Bash(gt submit:*)"} <= ifs
+        # One entry per kind, not per spelling: when Claude Code cannot parse
+        # a command it runs every entry, so each extra entry is one more process.
+        assert [h.get("if") for h in bash["hooks"]] == [
+            "Bash(git*commit*)", "Bash(git*push*)", "Bash(gt *)"]
+        assert all(h["asyncRewake"] is True and h["rewakeMessage"] for h in bash["hooks"])
 
+    @pytest.mark.parametrize("cmd", ["git stash push", "git commit-graph write --reachable",
+                                     "git log --grep commit", "gt log"])
+    def test_other_commands_the_if_patterns_let_through_do_nothing(self, workspace, hook_env, stub_api, cmd):
+        ws, repo = workspace
+        commit_file(repo, "app.py", VULN_PY)
+        rc, so, se = run_hook(bash_payload(repo, cmd, ""), hook_env)
+        assert rc == 0 and so.strip() == "" and not stub_api.calls
 
 
 def _read_state(env):
