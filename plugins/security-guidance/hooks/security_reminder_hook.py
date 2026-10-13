@@ -202,6 +202,16 @@ CONTINUATION_SUFFIX = (
 # Extra keys emit_metrics appends to every row this invocation emits.
 _TAIL_METRICS: Dict[str, Any] = {}
 
+# Reviewer context diagnostics from llm.agentic_review, most useful first.
+_REVIEWER_CONTEXT_KEYS = ("rv_cwd_gone", "rv_tool_err", "rv_tool_calls")
+
+
+def _note_reviewer_context(agentic_metrics):
+    """Queue the agentic reviewer's context diagnostics for this row."""
+    for key in _REVIEWER_CONTEXT_KEYS:
+        if agentic_metrics.get(key):
+            _TAIL_METRICS[key] = agentic_metrics[key]
+
 
 def emit_metrics(
     metrics,
@@ -1056,6 +1066,11 @@ def _agentic_review_with_race(
     _th.Thread(target=_fallback, daemon=True).start()
 
     winner, (g, v, m) = q.get()
+    # What the agentic run saw of its directory is kept when the fallback's
+    # result replaces it below.
+    reviewer_context = (
+        {k: m[k] for k in _REVIEWER_CONTEXT_KEYS if k in m} if winner == "agentic" else {}
+    )
     if winner == "agentic" and m.get("agentic_fallback") and fallback_started.is_set():
         # The caller would rerun the single-shot review the fallback has
         # already started; use its result instead.
@@ -1064,7 +1079,7 @@ def _agentic_review_with_race(
         else:
             winner, (g, v, m) = "fallback", (None, [], {
                 "agentic": False, "review_failed": True, "api_error": _RACE_TIMED_OUT})
-    m = dict(m)  # don't mutate the callee's metrics dict
+    m = {**m, **reviewer_context}  # a copy: don't mutate the callee's metrics dict
     m["race_winner"] = 1 if winner == "agentic" else 2
     m["race_delay_s"] = delay_s
     m["race_started"] = 1 if fallback_started.is_set() else 0
@@ -1523,6 +1538,7 @@ def handle_commit_review_posttooluse(input_data):
             # the condition that used to replace the findings body occurs. Not
             # counted when the single-shot fallback wins the race.
             _TAIL_METRICS["child_stderr"] = _am["child_stderr"]
+        _note_reviewer_context(agentic_metrics)
         review_failed = bool(agentic_metrics.get("review_failed"))
         api_status = agentic_metrics.get("api_error")
         # Fall back to single-shot only on agentic FAILURE (SDK/investigate
@@ -1938,6 +1954,7 @@ def handle_push_sweep_posttooluse(input_data):
         )
         if agentic_metrics.get("child_stderr"):
             _TAIL_METRICS["child_stderr"] = agentic_metrics["child_stderr"]
+        _note_reviewer_context(agentic_metrics)
         review_failed = bool(agentic_metrics.get("review_failed"))
         api_status = agentic_metrics.get("api_error")
         if agentic_metrics.get("agentic_fallback"):
