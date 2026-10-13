@@ -83,6 +83,7 @@ from _base import (  # noqa: E402,F401
     PROVENANCE_TAG, PROVENANCE_BANNER,
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
     _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
+    _USAGE_CONTEXT, _log_usage,
     state_dir as _resolve_state_dir,
 )
 import extensibility  # noqa: E402
@@ -267,6 +268,7 @@ def emit_metrics(
     delivery channel above. Defaults to "PostToolUse" (commit-review and
     push-sweep are the most common callers); handle_stop_hook passes "Stop".
     """
+    _log_usage(_usage_metrics())
     head = {}
     if _PV and "pv" not in metrics:
         head["pv"] = _PV
@@ -1036,6 +1038,7 @@ def handle_commit_review_posttooluse(input_data):
     the Stop hook won't re-flag the same (filePath, vulnerableCode) pair.
     """
     session_id = input_data.get("session_id", "default")
+    _USAGE_CONTEXT["review"] = "commit"
     tool_input = input_data.get("tool_input", {})
     tool_response = input_data.get("tool_response", {})
     cwd = input_data.get("cwd", "")
@@ -1570,6 +1573,7 @@ def handle_push_sweep_posttooluse(input_data):
     command = tool_input.get("command", "") or ""
     cwd = input_data.get("cwd")
     session_id = input_data.get("session_id", "")
+    _USAGE_CONTEXT["review"] = "push"
     bash_output = (
         (tool_response.get("stdout", "") or "")
         + "\n"
@@ -2277,6 +2281,7 @@ def main():
         sys.exit(0)
 
     session_id = input_data.get("session_id", "default")
+    _USAGE_CONTEXT["session_id"] = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id))[:80]
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
     hook_event_name = input_data.get("hook_event_name", "")
