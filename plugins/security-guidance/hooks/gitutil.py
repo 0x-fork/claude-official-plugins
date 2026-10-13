@@ -41,6 +41,13 @@ GIT_CMD = [
     # content same) rewrites the index under index.lock, GIT_OPTIONAL_LOCKS or
     # not. Off, every diff here only reads the index, so none needs a copy.
     "-c", "diff.autoRefreshIndex=false",
+    # The diff parsers read `diff --git a/<old> b/<new>` headers. A user's
+    # diff.mnemonicPrefix (c/ w/ i/), diff.noprefix or diff.srcPrefix /
+    # diff.dstPrefix changes that shape, and every file would be dropped.
+    "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.srcPrefix=a/",
+    "-c", "diff.dstPrefix=b/",
 ]
 
 SAFE_GIT_CONFIG = (
