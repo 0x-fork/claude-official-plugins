@@ -1,6 +1,6 @@
 """ANTHROPIC_CUSTOM_HEADERS reach every call the plugin makes."""
 from conftest import (
-    STUB_VULN, VULN_PY, edit_payload, run_hook, stop_payload, ups_payload,
+    STUB_VULN, VULN_PY, edit_payload, metrics_of, run_hook, stop_payload, ups_payload,
 )
 
 import llm
@@ -63,8 +63,33 @@ class TestCustomHeaders:
         rc, so, se = run_hook(stop_payload(repo), e)
         assert rc == 2, (so, se)
         assert "command_injection" in se
+        assert metrics_of(so)["gateway_cfg"] == 3  # custom base URL and custom headers
         calls = [(m, p.split("?")[0]) for m, p, _ in gateway.requests]
         assert ("GET", "/v1/models") in calls and ("POST", "/v1/messages") in calls
         for method, path, headers in gateway.requests:
             if path.startswith("/v1/"):
                 assert headers.get(GATEWAY_KEY[0]) == GATEWAY_KEY[1], (method, path)
+
+    def test_gateway_cfg_is_a_number_with_no_names_or_values(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+        assert llm.gateway_cfg() == 0
+        for same_host in ("https://api.anthropic.com/", "https://API.anthropic.com:443"):
+            monkeypatch.setenv("ANTHROPIC_BASE_URL", same_host)
+            assert llm.gateway_cfg() == 0
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com")
+        assert llm.gateway_cfg() == 1
+        monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "anthropic-beta: extra-1")
+        assert llm.gateway_cfg() == 1  # beta lines are not sent
+        monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Ok: 1")
+        assert llm.gateway_cfg() == 3
+        monkeypatch.delenv("ANTHROPIC_BASE_URL")
+        assert llm.gateway_cfg() == 2
+
+    def test_gateway_cfg_is_left_out_when_no_api_call_was_made(self, env, gateway, workspace):
+        """Only rows that made API calls carry gateway_cfg."""
+        _, repo = workspace
+        rc, so, se = run_hook(stop_payload(repo), env)
+        assert rc == 0, (so, se)
+        row = metrics_of(so)
+        assert row["skipped"] is True and "gateway_cfg" not in row

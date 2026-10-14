@@ -32,6 +32,7 @@ class TestAgenticReviewerOn:
         sha, rc, so, se = _commit(repo, agentic_env)
         assert rc == 2, (so, se)
         assert metrics_of(so)["agentic_fallback"] == 2
+        assert metrics_of(so)["child_stderr"] >= 1  # the warning was counted, not shown
         body = _rewake_body(so, se)
         assert "command_injection" in body
         assert "connectors are disabled" not in body

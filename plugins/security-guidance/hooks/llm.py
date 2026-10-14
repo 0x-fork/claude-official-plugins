@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -318,6 +319,24 @@ def _custom_headers() -> List[Tuple[str, str]]:
             continue
         pairs.append((name, value))
     return pairs
+
+
+def gateway_cfg() -> int:
+    """How the plugin's own API calls are routed, for telemetry: bit 1 when
+    ANTHROPIC_BASE_URL names a host other than api.anthropic.com, bit 2 when
+    at least one ANTHROPIC_CUSTOM_HEADERS line is sent. 0 when neither. A
+    number only: no host, header name or value."""
+    cfg = 0
+    base = _anthropic_base_url()
+    try:
+        host = (urllib.parse.urlsplit(base).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if base and host != "api.anthropic.com":
+        cfg |= 1
+    if any(name.lower() != "anthropic-beta" for name, _ in _custom_headers()):
+        cfg |= 2
+    return cfg
 
 
 def _build_auth_headers(use_token, betas=("structured-outputs-2025-11-13",)):
@@ -1572,8 +1591,12 @@ def agentic_review(
     # Claude Code shows Claude as the review notice. Log it instead.
     child_stderr_lines = [0]
 
+    def _child_stderr_metric() -> Dict[str, int]:
+        return {"child_stderr": child_stderr_lines[0]} if child_stderr_lines[0] else {}
+
     def _on_child_stderr(line: str) -> None:
         child_stderr_lines[0] += 1
+        metrics["child_stderr"] = child_stderr_lines[0]
         if child_stderr_lines[0] <= 20:
             debug_log(f"agentic reviewer's CLI stderr | {str(line).rstrip()}")
         elif child_stderr_lines[0] == 21:
@@ -1687,12 +1710,14 @@ def agentic_review(
                          f"{json.dumps(inv, indent=2) if inv else '<none>'}")
     except Exception as e:
         debug_log(f"agentic_review: investigate failed ({e}); falling back")
-        return None, [], {"agentic_fallback": f"investigate:{type(e).__name__}"}
+        return None, [], {"agentic_fallback": f"investigate:{type(e).__name__}",
+                          **_child_stderr_metric()}
     metrics["investigate_ms"] = int((_t.time() - t0) * 1000)
     metrics["investigate_turns"] = inv_turns
     if inv is None:
         reason = inv_subtype or "no_structured_output"
-        return None, [], {"agentic_fallback": f"investigate:{reason}"}
+        return None, [], {"agentic_fallback": f"investigate:{reason}",
+                          **_child_stderr_metric()}
     # Keep medium-severity candidates through self-refute — that pass is the
     # real precision gate, and the model's investigate-stage severity rating
     # is conservative (it defaults to "medium"). Filtering to high/critical
