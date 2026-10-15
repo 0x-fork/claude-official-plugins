@@ -125,6 +125,7 @@ from reporesolve import (  # noqa: E402,F401
     toplevel_from_command, repo_containing_commit, scan_roots,
     resolve_repo_root, save_repo_hint, load_repo_hint,
 )
+import gitutil  # noqa: E402  module ref for per-run counters
 import llm  # noqa: E402  module ref for reassignable globals (_last_call_claude_http_error etc.)
 from llm import (  # noqa: E402,F401
     ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, HAS_API_CREDENTIALS,
@@ -198,6 +199,10 @@ CONTINUATION_SUFFIX = (
     "response."
 )
 
+# Extra keys emit_metrics appends to every row this invocation emits.
+_TAIL_METRICS: Dict[str, Any] = {}
+
+
 def emit_metrics(
     metrics,
     rewake_summary=None,
@@ -261,9 +266,21 @@ def emit_metrics(
     head = {}
     if _PV and "pv" not in metrics:
         head["pv"] = _PV
-    head.update(_usage_metrics())
+    usage = _usage_metrics()
+    head.update(usage)
     if head:
         metrics = {**head, **metrics}
+    # Diagnostic keys go last, so they are the first dropped when a row is
+    # over CC's key cap and never displace an existing key.
+    tail = {}
+    if usage or "review_ms" in metrics or metrics.get("review_failed"):
+        # Review rows say whether the plugin's calls went through a gateway,
+        # so the error rate behind gateways can be read per plugin version.
+        cfg = llm.gateway_cfg()
+        if cfg:
+            tail["gateway_cfg"] = cfg
+    tail.update(_TAIL_METRICS)
+    metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}
     if rewake_summary:
         out["rewakeSummary"] = rewake_summary
@@ -1507,6 +1524,11 @@ def handle_commit_review_posttooluse(input_data):
             repo_root, diff_files, rel_touched, previous_findings
         )
         agentic_metrics.update(_am)
+        if _am.get("child_stderr"):
+            # Lines the inner CLI wrote to stderr during the review: how often
+            # the condition that used to replace the findings body occurs. Not
+            # counted when the single-shot fallback wins the race.
+            _TAIL_METRICS["child_stderr"] = _am["child_stderr"]
         review_failed = bool(agentic_metrics.get("review_failed"))
         api_status = agentic_metrics.get("api_error")
         # Fall back to single-shot only on agentic FAILURE (SDK/investigate
@@ -1919,6 +1941,8 @@ def handle_push_sweep_posttooluse(input_data):
         concrete_guidance, vulns, agentic_metrics = _agentic_review_with_race(
             repo_root, diff_files, rel_touched, previous_findings
         )
+        if agentic_metrics.get("child_stderr"):
+            _TAIL_METRICS["child_stderr"] = agentic_metrics["child_stderr"]
         review_failed = bool(agentic_metrics.get("review_failed"))
         api_status = agentic_metrics.get("api_error")
         if agentic_metrics.get("agentic_fallback"):
@@ -2095,6 +2119,10 @@ def handle_stop_hook(input_data):
             "skipped": True, "skip_reason": reason, "fire_index": fire_count + 1,
             "diff_strategy_v2": True,
             **v2_metrics, **extra, **sweep,
+            **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
+               if gitutil._unparsed_diff_headers else {}),
+            **({"secret_shaped_skipped": len(gitutil._secret_shaped_skipped)}
+               if gitutil._secret_shaped_skipped else {}),
         })
         sys.exit(0)
 
@@ -2308,6 +2336,10 @@ def handle_stop_hook(input_data):
                if llm._last_review_truncated_bytes else {}),
             **({"repo_resolution": repo_res} if res_metrics else {}),
             **sweep_trimmed,
+            **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
+               if gitutil._unparsed_diff_headers else {}),
+            **({"secret_shaped_skipped": len(gitutil._secret_shaped_skipped)}
+               if gitutil._secret_shaped_skipped else {}),
         }, rewake_summary=_format_vulns_summary(vulns),
            additional_context=(PROVENANCE_BANNER + "\n\n"
                                + concrete_guidance + CONTINUATION_SUFFIX + "\n"),
@@ -2341,6 +2373,10 @@ def handle_stop_hook(input_data):
         **({"diff_truncated": llm._last_review_truncated_bytes}
            if llm._last_review_truncated_bytes else {}),
         **v2_metrics,
+        **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
+           if gitutil._unparsed_diff_headers else {}),
+        **({"secret_shaped_skipped": len(gitutil._secret_shaped_skipped)}
+           if gitutil._secret_shaped_skipped else {}),
     })
     sys.exit(0)
 

@@ -8,6 +8,7 @@ to work without retargeting.
 """
 import os
 import subprocess
+import time
 
 from _base import debug_log, _PV
 from gitutil import (
@@ -351,6 +352,12 @@ def _append_reviewed_shas(repo_root, shas, vulns_found=0):
 # =====================================================================
 
 UNTRACKED_BASELINE_CAP = 2000
+# Set in a snapshot that hit the cap, to the time the listing started. NUL
+# cannot occur in a path, so the key never collides with a file.
+UNTRACKED_CAPPED_AT_KEY = "\0capped_at_ns"
+# Coarse filesystem timestamps (1 s on ext3, 2 s on FAT) can stamp a file
+# created just after the snapshot as slightly older than it.
+_CAPPED_BASELINE_SLACK_NS = 2_000_000_000
 
 
 def _list_untracked(cwd):
@@ -377,6 +384,7 @@ def _list_untracked(cwd):
     the holdouts."""
     try:
         repo = _git_toplevel(cwd) or cwd
+        started_ns = time.time_ns()
         # core.quotePath=false comes from GIT_CMD globally (see gitutil.py).
         r = subprocess.run(
             [*GIT_CMD, "ls-files", "--others", "--exclude-standard", "-z"],
@@ -397,6 +405,10 @@ def _list_untracked(cwd):
                 out[p] = 0
             if len(out) >= UNTRACKED_BASELINE_CAP:
                 debug_log(f"_list_untracked: capped at {UNTRACKED_BASELINE_CAP}")
+                # The files past the cap are not recorded one by one. Record
+                # when the snapshot was taken so the Stop hook can still tell
+                # them from files created or edited during the turn.
+                out[UNTRACKED_CAPPED_AT_KEY] = started_ns
                 break
         return out
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as e:
@@ -442,14 +454,24 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
     if tracked_dirty is None:
         return [], "HEAD", repo, [], {"dirty_now_count": -1, "changed_since_count": -1, "review_set_count": 0}
 
+    capped_at_ns = untracked_at_baseline.get(UNTRACKED_CAPPED_AT_KEY)
+
     def _unchanged_since_baseline(p):
         base_mtime = untracked_at_baseline.get(p)
-        if base_mtime is None:
-            return False
         try:
-            return os.stat(os.path.join(repo, p)).st_mtime_ns == base_mtime
+            st = os.stat(os.path.join(repo, p))
         except OSError:
             return False
+        if base_mtime is not None:
+            return st.st_mtime_ns == base_mtime
+        if not capped_at_ns:
+            return False
+        # The snapshot stopped at the cap, so this file may simply be one it
+        # never reached. Without this, every pre-existing file past the cap
+        # looks new on every turn and the same files are reviewed again and
+        # again. A file created or edited during the turn has a later mtime
+        # or ctime than the snapshot; anything older was already there.
+        return max(st.st_mtime_ns, st.st_ctime_ns) < capped_at_ns - _CAPPED_BASELINE_SLACK_NS
 
     preexisting_unchanged = {p for p in untracked if _unchanged_since_baseline(p)}
     new_untracked = untracked - preexisting_unchanged
