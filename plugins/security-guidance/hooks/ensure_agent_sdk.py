@@ -396,6 +396,20 @@ def _pip_err_from_stderr(stderr_b):
     return f"other:{tail}" if tail else "other"
 
 
+# A package directory that has lost its files still imports, as a namespace
+# package, so a bare `import claude_agent_sdk` calls an emptied install
+# healthy and it is never rebuilt. A real install has a __file__; the probe
+# exits with _PROBE_EMPTIED when there is none. See #6612.
+_PROBE_EMPTIED = 3
+_SDK_IMPORT_PROBE = (
+    "import sys, claude_agent_sdk; "
+    f"sys.exit(0 if getattr(claude_agent_sdk, '__file__', None) else {_PROBE_EMPTIED})"
+)
+
+# Set by main() when the venv's probe exited with _PROBE_EMPTIED.
+_venv_was_emptied = False
+
+
 def _target_dir(state_dir) -> Path:
     return Path(state_dir) / "agent-sdk-libs"
 
@@ -411,7 +425,7 @@ def _target_sdk_importable(state_dir) -> bool:
     try:
         r = subprocess.run(
             [sys.executable, "-c",
-             "import sys; sys.path.insert(0, sys.argv[1]); import claude_agent_sdk",
+             "import sys; sys.path.insert(0, sys.argv[1]); " + _SDK_IMPORT_PROBE,
              str(target)],
             capture_output=True, timeout=10,
         )
@@ -496,9 +510,9 @@ def _venv_python_version(venv) -> int:
 
 
 def _install_context_metrics(outcome, state_dir) -> dict:
-    """Counts that size two open questions about the private SDK install; no
-    behaviour depends on them. Only on rows where the install exists, and
-    only when set.
+    """Counts that size open questions about the private SDK install; no
+    behaviour depends on them. Only when set, and the first three only on
+    rows where the install exists.
 
     sdk_no_creds / sdk_no_git: the session holds the install while the
     reviews it serves cannot run, for lack of model credentials or of a git
@@ -506,8 +520,13 @@ def _install_context_metrics(outcome, state_dir) -> dict:
 
     sdk_venv_py: the venv was built by another Python version than the one
     running the hooks, which is the one that loads it; its compiled
-    dependencies do not load there. See #5706."""
+    dependencies do not load there. See #5706.
+
+    sdk_venv_emptied: the venv's SDK package directory had lost its files
+    and this run went on to rebuild it, whatever the outcome. See #6612."""
     out = {}
+    if _venv_was_emptied:
+        out["sdk_venv_emptied"] = 1
     if outcome not in (NOOP_VENV, BUILT, BUILT_TARGET, NOOP_TARGET):
         return out
     try:
@@ -553,6 +572,8 @@ def main() -> tuple[int, str, str]:
     err_phase / err_kind are non-empty only on BUILD_FAILED — they let
     telemetry split bootstrap failures by root cause.
     """
+    global _venv_was_emptied
+    _venv_was_emptied = False
     # The SDK only serves the LLM reviews. With those switched off, or the
     # whole plugin (SECURITY_GUIDANCE_DISABLE=1), a venv of a few hundred MB
     # would be built for code that never runs, and the notice below would
@@ -612,11 +633,12 @@ def main() -> tuple[int, str, str]:
     if venv_py.exists():
         try:
             r = subprocess.run(
-                [str(venv_py), "-c", "import claude_agent_sdk"],
+                [str(venv_py), "-c", _SDK_IMPORT_PROBE],
                 capture_output=True, timeout=10,
             )
             if r.returncode == 0:
                 return NOOP_VENV, "", ""
+            _venv_was_emptied = r.returncode == _PROBE_EMPTIED
         except Exception:
             pass  # broken venv; rebuild below
 
