@@ -104,17 +104,22 @@ def consume_stop_state(session_id, clear=True):
             "fire_count_expired": expired and state.get("stop_hook_fire_count", 0) > 0,
             "previous_findings": [] if findings_expired else list(state.get("previous_findings", [])),
             "reviewed_diff_hash": state.get("reviewed_diff_hash"),
+            # State lost or overwritten since the last Stop (session_state).
+            "state_resets": state.get("state_resets", 0),
+            "state_overwrites": state.get("state_overwrites", 0),
         }
         if clear:
             state["touched_paths"] = []
             state.pop("reviewed_diff_hash", None)
+            state.pop("state_resets", None)
+            state.pop("state_overwrites", None)
         return snap
 
     return with_locked_state(session_id, _snap) or {
         "touched_paths": [], "baseline_sha": None, "head_at_capture": None,
         "untracked_at_baseline": {},
         "fire_count": 0, "fire_count_expired": False, "previous_findings": [],
-        "reviewed_diff_hash": None,
+        "reviewed_diff_hash": None, "state_resets": 0, "state_overwrites": 0,
     }
 
 

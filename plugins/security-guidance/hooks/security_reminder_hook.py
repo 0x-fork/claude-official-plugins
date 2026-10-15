@@ -2115,6 +2115,13 @@ def handle_stop_hook(input_data):
     head_at_capture = snap["head_at_capture"]
     untracked_at_baseline = snap.get("untracked_at_baseline") or {}
     previous_findings = snap["previous_findings"]
+    # Only when it happened: state lost to an unreadable file, and saves that
+    # overwrote another hook's (possible only without locking). SubagentStop
+    # does not clear them, so it does not report them either.
+    if not is_subagent:
+        for _k in ("state_resets", "state_overwrites"):
+            if isinstance(snap.get(_k), int) and snap[_k] > 0:
+                _TAIL_METRICS[_k] = snap[_k]
 
     # Sweep pattern-warning outcomes (pure local work; stop_hook_active is
     # already guaranteed False here so no double-count guard needed).
