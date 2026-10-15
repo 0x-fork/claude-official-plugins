@@ -86,6 +86,7 @@ from _base import (  # noqa: E402,F401
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
     _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
     state_dir as _resolve_state_dir,
+    write_hook_output as _write_hook_output,
 )
 import extensibility  # noqa: E402
 from patterns import (  # noqa: E402,F401
@@ -296,7 +297,7 @@ def emit_metrics(
             out["reason"] = additional_context
     if system_message:
         out["systemMessage"] = system_message
-    print(json.dumps(out), flush=True)
+    _write_hook_output(out)
 
 
 def _llm_review_off():
@@ -600,29 +601,38 @@ def handle_user_prompt_submit(input_data):
         sys.exit(0)
 
     session_id = input_data.get("session_id", "default")
-    # stash-create and ls-files both walk the worktree (~2-5s each in a very
-    # large repo). Run them concurrently so UPS latency stays ≈ max(both).
-    import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-        _f_sha = _ex.submit(capture_git_baseline, cwd)
-        _f_ut = _ex.submit(_list_untracked, cwd)
-        sha = _f_sha.result()
-        # Always capture the untracked snapshot. `git stash create` returns
-        # empty when there are no TRACKED changes, but pre-existing untracked
-        # files still need to be excluded from the next Stop's review_set —
-        # otherwise an untracked-only working tree gets every untracked file
-        # reviewed on every turn until something tracked is dirtied.
-        untracked_now = _f_ut.result() or {}
+    # The untracked snapshot has one reader: the Stop-hook diff review, which
+    # skips before reading it when either of these switches is off (see
+    # handle_stop_hook). Listing the worktree on every prompt then buys
+    # nothing, so only the stash baseline (still read by the Write pattern
+    # filter) is captured.
+    snapshot_untracked = ENABLE_STOP_REVIEW and ENABLE_CODE_SECURITY_REVIEW
+
+    def _capture(repo_cwd):
+        if not snapshot_untracked:
+            return capture_git_baseline(repo_cwd), None
+        # stash-create and ls-files both walk the worktree (~2-5s each in a
+        # very large repo). Run them concurrently so UPS latency stays
+        # ≈ max(both).
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
+            _f_sha = _ex.submit(capture_git_baseline, repo_cwd)
+            _f_ut = _ex.submit(_list_untracked, repo_cwd)
+            # Taken whether or not the stash produced a SHA. `git stash
+            # create` returns empty when there are no TRACKED changes, but
+            # pre-existing untracked files still need to be excluded from the
+            # next Stop's review_set — otherwise an untracked-only working
+            # tree gets every untracked file reviewed on every turn until
+            # something tracked is dirtied.
+            return _f_sha.result(), _f_ut.result() or {}
+
+    sha, untracked_now = _capture(cwd)
     if not sha and not _git_toplevel(cwd):
         hint = load_repo_hint(session_id)
         if hint:
             debug_log(f"UPS: cwd is not a git repo; using repo hint {hint!r}")
             cwd = hint
-            with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-                _f_sha = _ex.submit(capture_git_baseline, cwd)
-                _f_ut = _ex.submit(_list_untracked, cwd)
-                sha = _f_sha.result()
-                untracked_now = _f_ut.result() or {}
+            sha, untracked_now = _capture(cwd)
     head = _git_rev_parse_head(cwd)
 
     # If the previous turn's Stop hook never ran (user interrupt, follow-up
@@ -641,14 +651,24 @@ def handle_user_prompt_submit(input_data):
         # we still need to capture a baseline.
         if state.get("touched_paths") and state.get("baseline_sha"):
             preserved["value"] = True
+            # A baseline captured while the Stop review was off has no
+            # snapshot beside it. Without one the next Stop would take every
+            # untracked file in the tree as written this turn.
+            if untracked_now is not None and "untracked_at_baseline" not in state:
+                state["untracked_at_baseline"] = untracked_now
             return
         if sha:
             state["baseline_sha"] = sha
             state["head_at_capture"] = head
         # untracked_at_baseline is independent of whether the stash produced
-        # a SHA — write it unconditionally so compute_v2_review_set's
-        # preexisting-untracked exclusion works in untracked-only trees.
-        state["untracked_at_baseline"] = untracked_now
+        # a SHA, so compute_v2_review_set's preexisting-untracked exclusion
+        # works in untracked-only trees. None means no snapshot was taken
+        # (Stop review off): drop the previous one, which belongs to an older
+        # baseline.
+        if untracked_now is None:
+            state.pop("untracked_at_baseline", None)
+        else:
+            state["untracked_at_baseline"] = untracked_now
     with_locked_state(session_id, _save)
 
     if preserved["value"]:
@@ -743,26 +763,33 @@ _COMMIT_DIFFSTAT_PATTERNS = [
 # or trailing hook output isn't picked up and fed to `git show`.
 _COMMIT_SHA_RE = re.compile(r'^\[[^\]]*?\b([0-9a-f]{7,40})\]', re.MULTILINE)
 
-# Regex matching `git commit` commands. Mirrors Claude Code's own commit
-# detection — it does NOT tolerate `git -c k=v commit` global options, which
-# keeps this hook aligned with CC's commit attribution on what counts as a
-# commit.
+# Regex matching `git commit` commands, global options included (see below).
 #
 # Also matches `gt create` and `gt modify` — Graphite's stacked-PR wrapper
 # around git. `gt create` produces a new commit (mapped to git commit
 # semantics); `gt modify` amends the current commit (mapped to git commit
-# --amend, also flagged by _GIT_AMEND_RE below). The hooks.json matcher
-# widening for `gt create:*` / `gt modify:*` / `gt submit:*` ships in the
-# same change set — without that widening this regex change is dead code
-# because the hook subprocess never spawns for gt invocations. See #2048.
+# --amend, also flagged by _GIT_AMEND_RE below). hooks.json has a
+# `Bash(gt *)` entry so the hook subprocess spawns for gt invocations.
+#
+# Global options allowed between `git` and the subcommand, shared by
+# _GIT_COMMIT_RE and _GIT_PUSH_RE: `-C <path>`, `-c key=val`, `--opt=val`,
+# the long options that take a separate value, and flags that take none
+# (`--no-pager`, `-p`). A value may be quoted in part (`-c user.name="A B"`).
+_GIT_OPT_VALUE = r'''(?:[^\s"']|"[^"]*"|'[^']*')+'''
+_GIT_VALUE_OPTS = r'git-dir|work-tree|namespace|config-env|attr-source'
+_GIT_GLOBAL_OPTS = (
+    r'(?:\s+-[Cc]\s+' + _GIT_OPT_VALUE
+    + r'|\s+--[^\s=]+=' + _GIT_OPT_VALUE
+    + r'|\s+--(?:' + _GIT_VALUE_OPTS + r')\s+' + _GIT_OPT_VALUE
+    # `--help` / `--version` run no subcommand.
+    + r'|\s+(?:--(?!(?:' + _GIT_VALUE_OPTS + r'|help|version)\s)[^\s=]+|-[pP])(?=\s))*'
+)
 _GIT_COMMIT_RE = re.compile(
-    # `git -C <path>` and `git -c key=val` global options are allowed between
-    # `git` and `commit` (mirrors the long-standing tolerance in
-    # _GIT_PUSH_RE). Without this, `git -C /repo commit` is silently dropped
-    # by the handler — see #2089's secondary finding. The gt branch has no
-    # global-option layer to worry about.
-    r'\bgit(?:\s+-[Cc]\s+(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*)|\s+--[^\s=]+=\S+'
-    r'|\s+--(?:git-dir|work-tree)\s+\S+)*\s+commit\b'
+    # Without the global-option tolerance, `git -C /repo commit` is silently
+    # dropped by the handler — see #2089's secondary finding. The gt branch
+    # has no global-option layer to worry about.
+    # `(?!-)`: not the plumbing commands `git commit-graph` / `git commit-tree`.
+    r'\bgit' + _GIT_GLOBAL_OPTS + r'\s+commit\b(?!-)'
     r'|\bgt\s+(?:create|modify)\b'
 )
 # Match either the `--amend` flag (with the leading whitespace boundary
@@ -787,11 +814,9 @@ COMMIT_REVIEW_RATE_WINDOW_S = int(
 # ─── push-sweep ─────────────────────────────────────────────────────────────
 #
 # Mirrors Claude Code's own push-command matching — tolerates `git -C <p>` /
-# `git -c k=v` global options. The hooks.json `Bash(git push:*)` matcher
-# (subcommand prefix) doesn't, but those forms are rare in practice
-# and the python only ever runs after CC's matcher fired, so this regex is a
-# defensive re-gate, not a widening — `git -C path push` won't reach python
-# unless chained with a plain `git push` in the same compound command.
+# `git -c k=v` global options, as the hooks.json `Bash(git*push*)` matcher
+# does. That matcher also lets through e.g. `git stash push`; this regex is
+# what decides whether the command is a push.
 #
 # `gh pr create` is intentionally NOT a separate hooks.json matcher: gh runs
 # `git push` as a child process, which CC's matcher doesn't observe (it sees
@@ -799,14 +824,13 @@ COMMIT_REVIEW_RATE_WINDOW_S = int(
 # entry would buy minimal extra coverage (sessions that push only via gh) at
 # the cost of an extra python spawn on every `... && gh pr create` compound
 # (the common case). Those sessions are caught on their next standalone `git push`.
-# Matches `git push` (with optional `-c k=v` / `-C path` global options
-# CC's hooks.json matcher doesn't tolerate) OR `gt submit` — Graphite's
+# Matches `git push` (with optional `-c k=v` / `-C path` global options)
+# OR `gt submit` — Graphite's
 # stacked-PR push command. gt submit forwards to `git push` internally,
 # but the bash hook fires on Claude's top-level command so we need to
 # recognize gt submit at the matcher level. See #2048.
 _GIT_PUSH_RE = re.compile(
-    r'(?:\bgit(?:\s+-[cC]\s+(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*)|\s+--[^\s=]+=\S+'
-    r'|\s+--(?:git-dir|work-tree)\s+\S+)*\s+push\b|\bgt\s+submit\b)'
+    r'(?:\bgit' + _GIT_GLOBAL_OPTS + r'\s+push\b|\bgt\s+submit\b)'
 )
 
 # `git push` stdout: "abc1234..def5678  branch -> branch" (or `+abc..def` on
@@ -827,8 +851,9 @@ PUSH_SWEEP_REPORT_CAP = int(os.environ.get("SG_PUSH_SWEEP_REPORT_CAP", "3"))
 def _claim_bash_hook_once(input_data):
     """De-dupe across hooks.json `if` matchers firing for the same Bash call.
 
-    `git commit -m x && git push` matches both `Bash(git commit:*)` and
-    `Bash(git push:*)` `if` configs → CC spawns this script twice with the
+    `git commit -m x && git push` matches both `Bash(git*commit*)` and
+    `Bash(git*push*)` `if` configs, and a command CC cannot parse runs every
+    `if` config → CC spawns this script more than once with the
     SAME `tool_use_id`. The first spawn atomically creates a
     sentinel under `.git/`; subsequent spawns see it and exit early. Avoids
     redundant LLM calls (and the redundant asyncRewake) on compound commands.
@@ -1232,9 +1257,10 @@ def handle_commit_review_posttooluse(input_data):
 
     command = tool_input.get("command", "")
     if not isinstance(command, str) or not _GIT_COMMIT_RE.search(command):
-        # Defensive only — hooks.json's `"if": "Bash(git commit:*)"` is the
-        # real gate so CC never spawns python3 for ls/grep/etc. This catches
-        # cases where CC's command matching fails open and spawns the hook anyway.
+        # hooks.json's `"if": "Bash(git*commit*)"` only keeps CC from
+        # spawning python3 for ls/grep/etc. It lets through other git commands
+        # with "commit" in them (`git merge --no-commit`), and CC runs the hook
+        # anyway when it cannot parse the command; this regex decides.
         sys.exit(0)
 
     debug_log(f"Commit review: detected git commit in command")
@@ -1786,9 +1812,8 @@ def handle_push_sweep_posttooluse(input_data):
     )
     interrupted = tool_response.get("interrupted", False)
 
-    # Re-gate: hooks.json `if` matched, but confirm with the broader regex
-    # (defensive — `git -C`/`-c` forms won't reach here via the hooks.json
-    # prefix matcher alone, but a compound with a plain `git push` would).
+    # Re-gate: hooks.json `if` matched (or CC could not parse the command
+    # and ran every entry), so confirm with the regex.
     if not _GIT_PUSH_RE.search(command):
         sys.exit(0)
 
@@ -2160,6 +2185,13 @@ def handle_stop_hook(input_data):
     head_at_capture = snap["head_at_capture"]
     untracked_at_baseline = snap.get("untracked_at_baseline") or {}
     previous_findings = snap["previous_findings"]
+    # Only when it happened: state lost to an unreadable file, and saves that
+    # overwrote another hook's (possible only without locking). SubagentStop
+    # does not clear them, so it does not report them either.
+    if not is_subagent:
+        for _k in ("state_resets", "state_overwrites"):
+            if isinstance(snap.get(_k), int) and snap[_k] > 0:
+                _TAIL_METRICS[_k] = snap[_k]
 
     # Sweep pattern-warning outcomes (pure local work; stop_hook_active is
     # already guaranteed False here so no double-count guard needed).
@@ -2547,11 +2579,15 @@ def main():
 
     # Handle PostToolUse[Bash] — commit review or push sweep (asyncRewake).
     #
-    # hooks.json has two `if` configs under the Bash matcher (`git commit:*`
-    # and `git push:*`). CC evaluates each `if` independently and spawns this
+    # hooks.json has three `if` configs under the Bash matcher (`git*commit*`,
+    # `git*push*` and `gt *`), kept to one per kind because CC runs EVERY
+    # entry when it cannot parse the command (loops, some substitutions): one
+    # entry per spelling meant one python per entry on those calls. CC
+    # evaluates each `if` independently and spawns this
     # script ONCE PER MATCH — so `git commit -m x && git push` spawns python
     # twice with the same command string and the same tool_use_id. The python
-    # cannot tell which `if` fired it.
+    # cannot tell which `if` fired it, which is also why the three entries
+    # share one rewakeMessage.
     #
     # Routing therefore MUST check commit FIRST so that compound commit+push
     # commands continue to hit commit-review (the pre-existing behaviour) on
@@ -2574,7 +2610,7 @@ def main():
             # Another spawn for this same tool_use_id already claimed the
             # work (compound matched multiple `if` configs). Emit a single
             # metric so telemetry can count how often the de-dupe kicks in.
-            print(json.dumps({"metrics": {"bash_hook_dedup": True}}), flush=True)
+            _write_hook_output({"metrics": {"bash_hook_dedup": True}})
             sys.exit(0)
         if _GIT_COMMIT_RE.search(cmd):
             handle_commit_review_posttooluse(input_data)
@@ -2659,7 +2695,7 @@ def main():
             if notice:
                 output["systemMessage"] = notice
         if output:
-            print(json.dumps(output))
+            _write_hook_output(output)
 
     sys.exit(0)
 
