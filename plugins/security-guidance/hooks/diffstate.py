@@ -198,7 +198,8 @@ def capture_git_baseline(cwd):
     NOTE: `git stash create` does NOT capture untracked files. UPS pairs this
     SHA with a `_list_untracked()` snapshot stored as `untracked_at_baseline`,
     and `compute_v2_review_set` subtracts that set so pre-existing untracked
-    files are not reviewed as Claude-authored.
+    files are not reviewed as Claude-authored. UPS takes no snapshot while the
+    Stop review, its only reader, is switched off.
     """
     # stdout is a SHA so text=True is safe on stdout, but a non-ASCII
     # filename in `git stash create`'s STDERR warning (e.g. a worktree
