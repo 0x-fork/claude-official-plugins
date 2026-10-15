@@ -7,6 +7,7 @@ circular import). It must stay free of any other intra-plugin imports.
 """
 import json
 import os
+import re
 import threading
 from datetime import datetime
 
@@ -168,6 +169,10 @@ _USAGE = {
     # reported it manually.
     "http_err_last": 0,    # most recent HTTP error code this invocation
     "http_err_count": 0,   # total HTTP errors (4xx + 5xx + network)
+    # For the usage log line only: model ids as recorded (the requested alias
+    # on the Agent SDK path), and whether any call had no price-table entry.
+    "models": [],
+    "default_priced": False,
 }
 _USAGE_LOCK = threading.Lock()
 
@@ -204,12 +209,15 @@ def _record_usage(usage, model, cost_usd=None):
         cw = int(u.get("cache_creation_input_tokens") or 0)
     except (TypeError, ValueError):
         return
+    default_priced = False
     if cost_usd is None:
         pin, pout = _PRICE_DEFAULT
+        default_priced = True
         m = (model or "").lower()
         for k, v in sorted(_PRICE_PER_MTOK.items(), key=lambda kv: -len(kv[0])):
             if m.startswith(k):
                 pin, pout = v
+                default_priced = False
                 break
         cost_usd = (i * pin + o * pout + cr * pin * 0.1 + cw * pin * 1.25) / 1_000_000
     with _USAGE_LOCK:
@@ -219,6 +227,10 @@ def _record_usage(usage, model, cost_usd=None):
         _USAGE["cw"] += cw
         _USAGE["cost"] += float(cost_usd or 0.0)
         _USAGE["n"] += 1
+        _USAGE["default_priced"] = _USAGE["default_priced"] or default_priced
+        name = re.sub(r"[^A-Za-z0-9_.:/@-]", "_", str(model or ""))[:80]
+        if name and name not in _USAGE["models"]:
+            _USAGE["models"].append(name)
 
 
 def _record_http_error(status):
@@ -243,6 +255,36 @@ def _record_http_error(status):
     with _USAGE_LOCK:
         _USAGE["http_err_last"] = s
         _USAGE["http_err_count"] += 1
+
+
+# Set by main() and the review handlers: which review this invocation runs
+# and for which Claude Code session, so the usage log line can be attributed.
+_USAGE_CONTEXT = {"session_id": "", "review": "stop"}
+
+
+def _log_usage(usage):
+    """Write this invocation's review usage to the debug log.
+
+    `usage` is a `_usage_metrics()` snapshot, the same numbers that go out
+    with the hook's metrics. The raw-HTTP review leaves no Claude Code
+    transcript and no OpenTelemetry event; without this line nothing on the
+    machine records what it used. `est_cost_usd` is that same rollup: list
+    prices (the inner CLI's own figure on the Agent SDK path), `~` appended
+    when a model had no price-table entry and the default rate was used.
+    """
+    if not usage.get("api_calls"):
+        return
+    with _USAGE_LOCK:
+        models = ",".join(_USAGE["models"]) or "-"
+        approx = "~" if _USAGE["default_priced"] else ""
+    debug_log(
+        f"Review usage: review={_USAGE_CONTEXT.get('review') or '-'} "
+        f"session={_USAGE_CONTEXT.get('session_id') or '-'} "
+        f"model={models} calls={usage['api_calls']} "
+        f"in={usage['tok_in']} out={usage['tok_out']} "
+        f"cache_read={usage['tok_cache_r']} cache_write={usage['tok_cache_w']} "
+        f"est_cost_usd={usage['cost_usd']:.4f}{approx}"
+    )
 
 
 def _usage_metrics():
