@@ -2123,6 +2123,8 @@ def handle_stop_hook(input_data):
             **v2_metrics, **extra, **sweep,
             **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
                if gitutil._unparsed_diff_headers else {}),
+            **({"secret_shaped_skipped": len(gitutil._secret_shaped_skipped)}
+               if gitutil._secret_shaped_skipped else {}),
         })
         sys.exit(0)
 
@@ -2338,6 +2340,8 @@ def handle_stop_hook(input_data):
             **sweep_trimmed,
             **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
                if gitutil._unparsed_diff_headers else {}),
+            **({"secret_shaped_skipped": len(gitutil._secret_shaped_skipped)}
+               if gitutil._secret_shaped_skipped else {}),
         }, rewake_summary=_format_vulns_summary(vulns),
            additional_context=(PROVENANCE_BANNER + "\n\n"
                                + concrete_guidance + CONTINUATION_SUFFIX + "\n"),
@@ -2373,6 +2377,8 @@ def handle_stop_hook(input_data):
         **v2_metrics,
         **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
            if gitutil._unparsed_diff_headers else {}),
+        **({"secret_shaped_skipped": len(gitutil._secret_shaped_skipped)}
+           if gitutil._secret_shaped_skipped else {}),
     })
     sys.exit(0)
 
