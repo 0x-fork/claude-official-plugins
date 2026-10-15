@@ -70,7 +70,7 @@ Runs two parallel review calls and unions the findings. Catches a few percentage
 
 Drop a `claude-security-guidance.md` in any of:
 
-- `~/.claude/claude-security-guidance.md` — user-wide rules
+- `~/.claude/claude-security-guidance.md` — user-wide rules (when `CLAUDE_CONFIG_DIR` is set, the same file in that directory is read too)
 - `<project>/.claude/claude-security-guidance.md` — project rules, intended to be committed
 - `<project>/.claude/claude-security-guidance.local.md` — local overrides, intended to be `.gitignore`'d
 
