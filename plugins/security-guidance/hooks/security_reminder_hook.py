@@ -533,29 +533,38 @@ def handle_user_prompt_submit(input_data):
         sys.exit(0)
 
     session_id = input_data.get("session_id", "default")
-    # stash-create and ls-files both walk the worktree (~2-5s each in a very
-    # large repo). Run them concurrently so UPS latency stays ≈ max(both).
-    import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-        _f_sha = _ex.submit(capture_git_baseline, cwd)
-        _f_ut = _ex.submit(_list_untracked, cwd)
-        sha = _f_sha.result()
-        # Always capture the untracked snapshot. `git stash create` returns
-        # empty when there are no TRACKED changes, but pre-existing untracked
-        # files still need to be excluded from the next Stop's review_set —
-        # otherwise an untracked-only working tree gets every untracked file
-        # reviewed on every turn until something tracked is dirtied.
-        untracked_now = _f_ut.result() or {}
+    # The untracked snapshot has one reader: the Stop-hook diff review, which
+    # skips before reading it when either of these switches is off (see
+    # handle_stop_hook). Listing the worktree on every prompt then buys
+    # nothing, so only the stash baseline (still read by the Write pattern
+    # filter) is captured.
+    snapshot_untracked = ENABLE_STOP_REVIEW and ENABLE_CODE_SECURITY_REVIEW
+
+    def _capture(repo_cwd):
+        if not snapshot_untracked:
+            return capture_git_baseline(repo_cwd), None
+        # stash-create and ls-files both walk the worktree (~2-5s each in a
+        # very large repo). Run them concurrently so UPS latency stays
+        # ≈ max(both).
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
+            _f_sha = _ex.submit(capture_git_baseline, repo_cwd)
+            _f_ut = _ex.submit(_list_untracked, repo_cwd)
+            # Taken whether or not the stash produced a SHA. `git stash
+            # create` returns empty when there are no TRACKED changes, but
+            # pre-existing untracked files still need to be excluded from the
+            # next Stop's review_set — otherwise an untracked-only working
+            # tree gets every untracked file reviewed on every turn until
+            # something tracked is dirtied.
+            return _f_sha.result(), _f_ut.result() or {}
+
+    sha, untracked_now = _capture(cwd)
     if not sha and not _git_toplevel(cwd):
         hint = load_repo_hint(session_id)
         if hint:
             debug_log(f"UPS: cwd is not a git repo; using repo hint {hint!r}")
             cwd = hint
-            with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-                _f_sha = _ex.submit(capture_git_baseline, cwd)
-                _f_ut = _ex.submit(_list_untracked, cwd)
-                sha = _f_sha.result()
-                untracked_now = _f_ut.result() or {}
+            sha, untracked_now = _capture(cwd)
     head = _git_rev_parse_head(cwd)
 
     # If the previous turn's Stop hook never ran (user interrupt, follow-up
@@ -574,14 +583,24 @@ def handle_user_prompt_submit(input_data):
         # we still need to capture a baseline.
         if state.get("touched_paths") and state.get("baseline_sha"):
             preserved["value"] = True
+            # A baseline captured while the Stop review was off has no
+            # snapshot beside it. Without one the next Stop would take every
+            # untracked file in the tree as written this turn.
+            if untracked_now is not None and "untracked_at_baseline" not in state:
+                state["untracked_at_baseline"] = untracked_now
             return
         if sha:
             state["baseline_sha"] = sha
             state["head_at_capture"] = head
         # untracked_at_baseline is independent of whether the stash produced
-        # a SHA — write it unconditionally so compute_v2_review_set's
-        # preexisting-untracked exclusion works in untracked-only trees.
-        state["untracked_at_baseline"] = untracked_now
+        # a SHA, so compute_v2_review_set's preexisting-untracked exclusion
+        # works in untracked-only trees. None means no snapshot was taken
+        # (Stop review off): drop the previous one, which belongs to an older
+        # baseline.
+        if untracked_now is None:
+            state.pop("untracked_at_baseline", None)
+        else:
+            state["untracked_at_baseline"] = untracked_now
     with_locked_state(session_id, _save)
 
     if preserved["value"]:
