@@ -119,6 +119,7 @@ from diffstate import (  # noqa: E402,F401
     get_baseline_file_content, capture_git_baseline,
     _REVIEWED_SHAS_BASENAME, _REVIEWED_SHAS_CAP,
     _reviewed_shas_path, _load_reviewed_shas, _append_reviewed_shas,
+    _full_shas, _mark_inflight, _load_inflight_shas, _reviewed_after_inflight,
     UNTRACKED_BASELINE_CAP, _list_untracked, compute_v2_review_set,
 )
 from reporesolve import (  # noqa: E402,F401
@@ -795,6 +796,13 @@ _PUSH_RANGE_RE = re.compile(
 MAX_PUSH_SWEEP_FILES = int(os.environ.get("SG_PUSH_SWEEP_MAX_FILES", "30"))
 MAX_PUSH_SWEEP_RANGE = int(os.environ.get("SG_PUSH_SWEEP_MAX_RANGE", "50"))
 PUSH_SWEEP_REPORT_CAP = int(os.environ.get("SG_PUSH_SWEEP_REPORT_CAP", "3"))
+# How long a push review waits for a commit review that is still running on
+# the pushed commits, before reviewing them itself. Longer than the agentic
+# race delay, so a commit review that fell back to single-shot can finish.
+try:
+    INFLIGHT_WAIT_S = int(os.environ.get("SG_INFLIGHT_WAIT_S", "") or 240)
+except ValueError:
+    INFLIGHT_WAIT_S = 240
 
 def _claim_bash_hook_once(input_data):
     """De-dupe across hooks.json `if` matchers firing for the same Bash call.
@@ -1283,8 +1291,13 @@ def handle_commit_review_posttooluse(input_data):
         _root = repo_root
         _fresh, _stale = _git_reflog_recent_commits(_root)
         if _fresh:
+            # Commits an earlier call's review is still working on are that
+            # review's: it records them when it has a verdict. (Read before
+            # the reviewed set, so one that ends in between counts as reviewed.)
+            _inflight = _load_inflight_shas(_root, _fresh)
             _already = _load_reviewed_shas(_root)
-            _reflog_shas = [s for s in _fresh if s not in _already]
+            _reflog_shas = [s for s in _fresh
+                            if s not in _already and s not in _inflight]
             if _reflog_shas:
                 commit_succeeded = True
                 debug_log(
@@ -1296,8 +1309,9 @@ def handle_commit_review_posttooluse(input_data):
                 # Fresh commit(s) in reflog but all already in
                 # sg-reviewed-shas — likely a Bash retry or the commit was
                 # reviewed via a prior fire. Correct to skip; sub=2 lets telemetry
-                # split this from genuine fails.
-                _skip_21_sub = 2
+                # split this from genuine fails. sub=5: at least one is still
+                # being reviewed by an earlier call.
+                _skip_21_sub = 5 if any(s not in _already for s in _fresh) else 2
         elif _stale:
             _skip_21_sub = 3  # commit entries exist but all >120s old
         else:
@@ -1556,6 +1570,10 @@ def handle_commit_review_posttooluse(input_data):
         return list(state.get("previous_findings", []))
 
     previous_findings = with_locked_state(session_id, _read_previous) or []
+
+    # Tell a push review (or the next commit's reflog scan) that these commits
+    # are being reviewed, so it does not start a second review of them.
+    _mark_inflight(repo_root, _full_shas(repo_root, shas))
 
     review_start = _time.time()
 
@@ -1911,13 +1929,27 @@ def handle_push_sweep_posttooluse(input_data):
                       "pushed": len(push_range)})
         sys.exit(0)
 
-    reviewed = _load_reviewed_shas(repo_root)
+    # A commit review that is still running on these commits records them
+    # once it has a verdict. Wait for it instead of reviewing the same diff a
+    # second time; if it ends without one, they are reviewed here.
+    reviewed, _waited = _reviewed_after_inflight(
+        repo_root, push_range, INFLIGHT_WAIT_S)
+    _wait_m = {}
+    if _waited:
+        _wait_m = {"inflight_wait_s": max(1, int(round(_waited)))}
+        debug_log(f"Push sweep: waited {_waited:.0f}s for a running commit review")
     base, tail = _compute_push_sweep_base(prev_upstream, push_range, reviewed)
     prefix_advanced = len(push_range) - len(tail)
     if base is None:
         debug_log("Push sweep: every pushed commit already reviewed")
         emit_metrics({**_base, "pushed": len(push_range), "unreviewed": 0,
-                      "prefix_advanced": prefix_advanced})
+                      "prefix_advanced": prefix_advanced, **_wait_m})
+        sys.exit(0)
+    if _waited and head and _git_rev_parse_head(repo_root) != head:
+        # Same guard as above: the diff and the reviewer's file reads are
+        # both taken at HEAD, and HEAD left the pushed tip during the wait.
+        debug_log("Push sweep: HEAD moved while waiting, skipping")
+        emit_metrics({"skipped": True, "skip_reason": 44, **_base, **_wait_m})
         sys.exit(0)
 
     debug_log(f"Push sweep: range={len(push_range)} prefix_advanced="
@@ -1969,6 +2001,8 @@ def handle_push_sweep_posttooluse(input_data):
     if not _allowed:
         emit_metrics({"skipped": True, "skip_reason": 23, **_base})
         sys.exit(0)
+
+    _mark_inflight(repo_root, tail)
 
     import time as _time
     now = _time.time()
@@ -2033,6 +2067,7 @@ def handle_push_sweep_posttooluse(input_data):
         "prefix_advanced": prefix_advanced, "vulns_found": len(new_vulns),
         "files_reviewed": len(diff_files), "review_ms": review_ms,
         **({"deduped": n_deduped} if n_deduped else {}),
+        **_wait_m,
     }
     _push_rewake_summary = _format_vulns_summary(new_vulns, prefix="Push security review found")
 
