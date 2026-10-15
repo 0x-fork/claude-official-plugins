@@ -84,6 +84,7 @@ from _base import (  # noqa: E402,F401
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
     _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
     state_dir as _resolve_state_dir,
+    write_hook_output as _write_hook_output,
 )
 import extensibility  # noqa: E402
 from patterns import (  # noqa: E402,F401
@@ -294,7 +295,7 @@ def emit_metrics(
             out["reason"] = additional_context
     if system_message:
         out["systemMessage"] = system_message
-    print(json.dumps(out), flush=True)
+    _write_hook_output(out)
 
 # =====================================================================
 # State management
@@ -2512,7 +2513,7 @@ def main():
             # Another spawn for this same tool_use_id already claimed the
             # work (compound matched multiple `if` configs). Emit a single
             # metric so telemetry can count how often the de-dupe kicks in.
-            print(json.dumps({"metrics": {"bash_hook_dedup": True}}), flush=True)
+            _write_hook_output({"metrics": {"bash_hook_dedup": True}})
             sys.exit(0)
         if _GIT_COMMIT_RE.search(cmd):
             handle_commit_review_posttooluse(input_data)
@@ -2588,7 +2589,7 @@ def main():
                     "hookEventName": "PostToolUse",
                     "additionalContext": PROVENANCE_TAG + "\n\n" + "\n\n".join(all_guidance),
                 }
-            print(json.dumps(output))
+            _write_hook_output(output)
         elif all_guidance:
             # Defensive: pattern rules disabled but guidance somehow set (shouldn't happen)
             print(json.dumps({
