@@ -64,7 +64,7 @@ SECURITY_REVIEW_MODEL=claude-opus-5-5
 SECURITY_GUIDANCE_PORTABLE_OUTPUT=1   # default: detected
 ```
 
-The hooks' JSON output carries two fields that only Claude Code reads (`metrics` and `rewakeSummary`). A host that validates hook output against a closed schema rejects them. In portable mode they are left out and only the standard fields remain (`decision`, `reason`, `systemMessage`, `hookSpecificOutput`). It turns on by itself when the host passes `PLUGIN_ROOT` and does not identify itself as Claude Code; set the variable to `1` or `0` to force it either way.
+The hooks' JSON output carries two fields that only Claude Code reads (`metrics` and `rewakeSummary`), and the SessionStart hook prints a separate `{"async": ...}` line first. A host that validates hook output against a closed schema rejects them. In portable mode they are left out, so every hook prints one JSON object with only the standard fields (`decision`, `reason`, `systemMessage`, `hookSpecificOutput`), and the SessionStart hook runs to completion before the host continues. It turns on by itself when the host passes `PLUGIN_ROOT` and does not identify itself as Claude Code; set the variable to `1` or `0` to force it either way.
 
 ### Higher-recall mode
 

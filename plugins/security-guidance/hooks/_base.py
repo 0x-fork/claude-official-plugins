@@ -94,6 +94,47 @@ PROVENANCE_BANNER = (
 )
 
 
+# Output that only Claude Code reads: the `metrics` and `rewakeSummary` fields,
+# and the separate `{"async": ...}` line an async hook prints first. Other hosts
+# that run this plugin's hooks can validate hook output against a closed schema
+# and reject the whole output over a field or a second line they do not know,
+# which shows up as a hook error.
+_CLAUDE_CODE_OUTPUT_FIELDS = ("metrics", "rewakeSummary")
+
+
+def _detect_portable_output():
+    forced = os.environ.get("SECURITY_GUIDANCE_PORTABLE_OUTPUT", "").strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    if forced in ("0", "false", "no", "off"):
+        return False
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return False
+    return bool(os.environ.get("PLUGIN_ROOT"))
+
+
+# Decided once, from the environment the host started the hook with: code the
+# hook runs in-process later can set these variables itself.
+_PORTABLE_OUTPUT = _detect_portable_output()
+
+
+def portable_output():
+    """True when stdout should carry only the standard hook output fields.
+
+    SECURITY_GUIDANCE_PORTABLE_OUTPUT=1 or =0 forces it on or off. Otherwise it
+    is on only when the host passes PLUGIN_ROOT and does not identify itself as
+    Claude Code, so Claude Code and direct invocations are unchanged."""
+    return _PORTABLE_OUTPUT
+
+
+def write_hook_output(out):
+    """Print one hook output line. In portable mode the Claude Code only
+    fields are left out; what remains (possibly `{}`) is still valid output."""
+    if portable_output():
+        out = {k: v for k, v in out.items() if k not in _CLAUDE_CODE_OUTPUT_FIELDS}
+    print(json.dumps(out), flush=True)
+
+
 def _read_plugin_version_int():
     """Encode plugin.json version "M.m.p" as M*10000 + m*100 + p so it fits the
     bool|number metrics constraint. Returns 0 if unreadable."""
