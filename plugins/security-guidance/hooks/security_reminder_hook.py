@@ -665,15 +665,26 @@ _COMMIT_SHA_RE = re.compile(r'^\[[^\]]*?\b([0-9a-f]{7,40})\]', re.MULTILINE)
 # semantics); `gt modify` amends the current commit (mapped to git commit
 # --amend, also flagged by _GIT_AMEND_RE below). hooks.json has a
 # `Bash(gt *)` entry so the hook subprocess spawns for gt invocations.
+#
+# Global options allowed between `git` and the subcommand, shared by
+# _GIT_COMMIT_RE and _GIT_PUSH_RE: `-C <path>`, `-c key=val`, `--opt=val`,
+# the long options that take a separate value, and flags that take none
+# (`--no-pager`, `-p`). A value may be quoted in part (`-c user.name="A B"`).
+_GIT_OPT_VALUE = r'''(?:[^\s"']|"[^"]*"|'[^']*')+'''
+_GIT_VALUE_OPTS = r'git-dir|work-tree|namespace|config-env|attr-source'
+_GIT_GLOBAL_OPTS = (
+    r'(?:\s+-[Cc]\s+' + _GIT_OPT_VALUE
+    + r'|\s+--[^\s=]+=' + _GIT_OPT_VALUE
+    + r'|\s+--(?:' + _GIT_VALUE_OPTS + r')\s+' + _GIT_OPT_VALUE
+    # `--help` / `--version` run no subcommand.
+    + r'|\s+(?:--(?!(?:' + _GIT_VALUE_OPTS + r'|help|version)\s)[^\s=]+|-[pP])(?=\s))*'
+)
 _GIT_COMMIT_RE = re.compile(
-    # `git -C <path>` and `git -c key=val` global options are allowed between
-    # `git` and `commit` (mirrors the long-standing tolerance in
-    # _GIT_PUSH_RE). Without this, `git -C /repo commit` is silently dropped
-    # by the handler — see #2089's secondary finding. The gt branch has no
-    # global-option layer to worry about.
-    r'\bgit(?:\s+-[Cc]\s+(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*)|\s+--[^\s=]+=\S+'
+    # Without the global-option tolerance, `git -C /repo commit` is silently
+    # dropped by the handler — see #2089's secondary finding. The gt branch
+    # has no global-option layer to worry about.
     # `(?!-)`: not the plumbing commands `git commit-graph` / `git commit-tree`.
-    r'|\s+--(?:git-dir|work-tree)\s+\S+)*\s+commit\b(?!-)'
+    r'\bgit' + _GIT_GLOBAL_OPTS + r'\s+commit\b(?!-)'
     r'|\bgt\s+(?:create|modify)\b'
 )
 # Match either the `--amend` flag (with the leading whitespace boundary
@@ -714,8 +725,7 @@ COMMIT_REVIEW_RATE_WINDOW_S = int(
 # but the bash hook fires on Claude's top-level command so we need to
 # recognize gt submit at the matcher level. See #2048.
 _GIT_PUSH_RE = re.compile(
-    r'(?:\bgit(?:\s+-[cC]\s+(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*)|\s+--[^\s=]+=\S+'
-    r'|\s+--(?:git-dir|work-tree)\s+\S+)*\s+push\b|\bgt\s+submit\b)'
+    r'(?:\bgit' + _GIT_GLOBAL_OPTS + r'\s+push\b|\bgt\s+submit\b)'
 )
 
 # `git push` stdout: "abc1234..def5678  branch -> branch" (or `+abc..def` on
