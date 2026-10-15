@@ -675,26 +675,33 @@ _COMMIT_DIFFSTAT_PATTERNS = [
 # or trailing hook output isn't picked up and fed to `git show`.
 _COMMIT_SHA_RE = re.compile(r'^\[[^\]]*?\b([0-9a-f]{7,40})\]', re.MULTILINE)
 
-# Regex matching `git commit` commands. Mirrors Claude Code's own commit
-# detection — it does NOT tolerate `git -c k=v commit` global options, which
-# keeps this hook aligned with CC's commit attribution on what counts as a
-# commit.
+# Regex matching `git commit` commands, global options included (see below).
 #
 # Also matches `gt create` and `gt modify` — Graphite's stacked-PR wrapper
 # around git. `gt create` produces a new commit (mapped to git commit
 # semantics); `gt modify` amends the current commit (mapped to git commit
-# --amend, also flagged by _GIT_AMEND_RE below). The hooks.json matcher
-# widening for `gt create:*` / `gt modify:*` / `gt submit:*` ships in the
-# same change set — without that widening this regex change is dead code
-# because the hook subprocess never spawns for gt invocations. See #2048.
+# --amend, also flagged by _GIT_AMEND_RE below). hooks.json has a
+# `Bash(gt *)` entry so the hook subprocess spawns for gt invocations.
+#
+# Global options allowed between `git` and the subcommand, shared by
+# _GIT_COMMIT_RE and _GIT_PUSH_RE: `-C <path>`, `-c key=val`, `--opt=val`,
+# the long options that take a separate value, and flags that take none
+# (`--no-pager`, `-p`). A value may be quoted in part (`-c user.name="A B"`).
+_GIT_OPT_VALUE = r'''(?:[^\s"']|"[^"]*"|'[^']*')+'''
+_GIT_VALUE_OPTS = r'git-dir|work-tree|namespace|config-env|attr-source'
+_GIT_GLOBAL_OPTS = (
+    r'(?:\s+-[Cc]\s+' + _GIT_OPT_VALUE
+    + r'|\s+--[^\s=]+=' + _GIT_OPT_VALUE
+    + r'|\s+--(?:' + _GIT_VALUE_OPTS + r')\s+' + _GIT_OPT_VALUE
+    # `--help` / `--version` run no subcommand.
+    + r'|\s+(?:--(?!(?:' + _GIT_VALUE_OPTS + r'|help|version)\s)[^\s=]+|-[pP])(?=\s))*'
+)
 _GIT_COMMIT_RE = re.compile(
-    # `git -C <path>` and `git -c key=val` global options are allowed between
-    # `git` and `commit` (mirrors the long-standing tolerance in
-    # _GIT_PUSH_RE). Without this, `git -C /repo commit` is silently dropped
-    # by the handler — see #2089's secondary finding. The gt branch has no
-    # global-option layer to worry about.
-    r'\bgit(?:\s+-[Cc]\s+(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*)|\s+--[^\s=]+=\S+'
-    r'|\s+--(?:git-dir|work-tree)\s+\S+)*\s+commit\b'
+    # Without the global-option tolerance, `git -C /repo commit` is silently
+    # dropped by the handler — see #2089's secondary finding. The gt branch
+    # has no global-option layer to worry about.
+    # `(?!-)`: not the plumbing commands `git commit-graph` / `git commit-tree`.
+    r'\bgit' + _GIT_GLOBAL_OPTS + r'\s+commit\b(?!-)'
     r'|\bgt\s+(?:create|modify)\b'
 )
 # Match either the `--amend` flag (with the leading whitespace boundary
@@ -719,11 +726,9 @@ COMMIT_REVIEW_RATE_WINDOW_S = int(
 # ─── push-sweep ─────────────────────────────────────────────────────────────
 #
 # Mirrors Claude Code's own push-command matching — tolerates `git -C <p>` /
-# `git -c k=v` global options. The hooks.json `Bash(git push:*)` matcher
-# (subcommand prefix) doesn't, but those forms are rare in practice
-# and the python only ever runs after CC's matcher fired, so this regex is a
-# defensive re-gate, not a widening — `git -C path push` won't reach python
-# unless chained with a plain `git push` in the same compound command.
+# `git -c k=v` global options, as the hooks.json `Bash(git*push*)` matcher
+# does. That matcher also lets through e.g. `git stash push`; this regex is
+# what decides whether the command is a push.
 #
 # `gh pr create` is intentionally NOT a separate hooks.json matcher: gh runs
 # `git push` as a child process, which CC's matcher doesn't observe (it sees
@@ -731,14 +736,13 @@ COMMIT_REVIEW_RATE_WINDOW_S = int(
 # entry would buy minimal extra coverage (sessions that push only via gh) at
 # the cost of an extra python spawn on every `... && gh pr create` compound
 # (the common case). Those sessions are caught on their next standalone `git push`.
-# Matches `git push` (with optional `-c k=v` / `-C path` global options
-# CC's hooks.json matcher doesn't tolerate) OR `gt submit` — Graphite's
+# Matches `git push` (with optional `-c k=v` / `-C path` global options)
+# OR `gt submit` — Graphite's
 # stacked-PR push command. gt submit forwards to `git push` internally,
 # but the bash hook fires on Claude's top-level command so we need to
 # recognize gt submit at the matcher level. See #2048.
 _GIT_PUSH_RE = re.compile(
-    r'(?:\bgit(?:\s+-[cC]\s+(?:"[^"]*"|\'[^\']*\'|[^\s"\']\S*)|\s+--[^\s=]+=\S+'
-    r'|\s+--(?:git-dir|work-tree)\s+\S+)*\s+push\b|\bgt\s+submit\b)'
+    r'(?:\bgit' + _GIT_GLOBAL_OPTS + r'\s+push\b|\bgt\s+submit\b)'
 )
 
 # `git push` stdout: "abc1234..def5678  branch -> branch" (or `+abc..def` on
@@ -759,8 +763,9 @@ PUSH_SWEEP_REPORT_CAP = int(os.environ.get("SG_PUSH_SWEEP_REPORT_CAP", "3"))
 def _claim_bash_hook_once(input_data):
     """De-dupe across hooks.json `if` matchers firing for the same Bash call.
 
-    `git commit -m x && git push` matches both `Bash(git commit:*)` and
-    `Bash(git push:*)` `if` configs → CC spawns this script twice with the
+    `git commit -m x && git push` matches both `Bash(git*commit*)` and
+    `Bash(git*push*)` `if` configs, and a command CC cannot parse runs every
+    `if` config → CC spawns this script more than once with the
     SAME `tool_use_id`. The first spawn atomically creates a
     sentinel under `.git/`; subsequent spawns see it and exit early. Avoids
     redundant LLM calls (and the redundant asyncRewake) on compound commands.
@@ -1164,9 +1169,10 @@ def handle_commit_review_posttooluse(input_data):
 
     command = tool_input.get("command", "")
     if not isinstance(command, str) or not _GIT_COMMIT_RE.search(command):
-        # Defensive only — hooks.json's `"if": "Bash(git commit:*)"` is the
-        # real gate so CC never spawns python3 for ls/grep/etc. This catches
-        # cases where CC's command matching fails open and spawns the hook anyway.
+        # hooks.json's `"if": "Bash(git*commit*)"` only keeps CC from
+        # spawning python3 for ls/grep/etc. It lets through other git commands
+        # with "commit" in them (`git merge --no-commit`), and CC runs the hook
+        # anyway when it cannot parse the command; this regex decides.
         sys.exit(0)
 
     debug_log(f"Commit review: detected git commit in command")
@@ -1717,9 +1723,8 @@ def handle_push_sweep_posttooluse(input_data):
     )
     interrupted = tool_response.get("interrupted", False)
 
-    # Re-gate: hooks.json `if` matched, but confirm with the broader regex
-    # (defensive — `git -C`/`-c` forms won't reach here via the hooks.json
-    # prefix matcher alone, but a compound with a plain `git push` would).
+    # Re-gate: hooks.json `if` matched (or CC could not parse the command
+    # and ran every entry), so confirm with the regex.
     if not _GIT_PUSH_RE.search(command):
         sys.exit(0)
 
@@ -2476,11 +2481,15 @@ def main():
 
     # Handle PostToolUse[Bash] — commit review or push sweep (asyncRewake).
     #
-    # hooks.json has two `if` configs under the Bash matcher (`git commit:*`
-    # and `git push:*`). CC evaluates each `if` independently and spawns this
+    # hooks.json has three `if` configs under the Bash matcher (`git*commit*`,
+    # `git*push*` and `gt *`), kept to one per kind because CC runs EVERY
+    # entry when it cannot parse the command (loops, some substitutions): one
+    # entry per spelling meant one python per entry on those calls. CC
+    # evaluates each `if` independently and spawns this
     # script ONCE PER MATCH — so `git commit -m x && git push` spawns python
     # twice with the same command string and the same tool_use_id. The python
-    # cannot tell which `if` fired it.
+    # cannot tell which `if` fired it, which is also why the three entries
+    # share one rewakeMessage.
     #
     # Routing therefore MUST check commit FIRST so that compound commit+push
     # commands continue to hit commit-review (the pre-existing behaviour) on
