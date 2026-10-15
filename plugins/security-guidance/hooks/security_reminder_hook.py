@@ -121,6 +121,7 @@ from diffstate import (  # noqa: E402,F401
     _reviewed_shas_path, _load_reviewed_shas, _append_reviewed_shas,
     _full_shas, _mark_inflight, _load_inflight_shas, _reviewed_after_inflight,
     UNTRACKED_BASELINE_CAP, _list_untracked, compute_v2_review_set,
+    touched_scope, review_scope_code,
 )
 from reporesolve import (  # noqa: E402,F401
     RES_NONE, RES_CWD, RES_COMMAND, RES_SHA_SCAN, RES_TOUCHED_PATHS, RES_HINT,
@@ -128,6 +129,7 @@ from reporesolve import (  # noqa: E402,F401
     toplevel_from_command, repo_containing_commit, scan_roots,
     resolve_repo_root, save_repo_hint, load_repo_hint,
 )
+import diffstate  # noqa: E402  module ref for last_baseline_fail
 import gitutil  # noqa: E402  module ref for per-run counters
 import llm  # noqa: E402  module ref for reassignable globals (_last_call_claude_http_error etc.)
 from llm import (  # noqa: E402,F401
@@ -532,6 +534,14 @@ def extract_content_from_input(tool_name, tool_input):
 # Hook handlers
 # =====================================================================
 
+def _store_baseline_fail(state, fail):
+    """Keep diffstate.last_baseline_fail next to the baseline_sha it describes."""
+    if fail:
+        state["baseline_fail"] = fail
+    else:
+        state.pop("baseline_fail", None)
+
+
 def handle_user_prompt_submit(input_data):
     """
     Handle UserPromptSubmit — capture git baseline SHA.
@@ -583,6 +593,7 @@ def handle_user_prompt_submit(input_data):
             cwd = hint
             sha, untracked_now = _capture(cwd)
     head = _git_rev_parse_head(cwd)
+    baseline_fail = diffstate.last_baseline_fail
 
     # If the previous turn's Stop hook never ran (user interrupt, follow-up
     # during work, tool-reject, model crash, maxTurns, PostToolUse block…),
@@ -609,6 +620,8 @@ def handle_user_prompt_submit(input_data):
         if sha:
             state["baseline_sha"] = sha
             state["head_at_capture"] = head
+            state.pop("turn_touched", None)
+            _store_baseline_fail(state, baseline_fail)
         # untracked_at_baseline is independent of whether the stash produced
         # a SHA, so compute_v2_review_set's preexisting-untracked exclusion
         # works in untracked-only trees. None means no snapshot was taken
@@ -2263,6 +2276,23 @@ def handle_stop_hook(input_data):
         cwd, baseline_sha, head_at_capture, untracked_at_baseline
     )
     v2_metrics = {**res_metrics, **v2_metrics}
+    # Count-only view of how the review set relates to what the session's
+    # edit tools wrote. Only when a repo was read; never fails the review.
+    def _note_scope(files):
+        try:
+            if "scope" not in _scope:
+                _scope["scope"] = touched_scope(
+                    repo_root, input_data.get("cwd", ""), snap["turn_touched"])
+            # -1: the stored baseline could not be used in this repo.
+            fail = (3 if v2_metrics.get("changed_since_count") == -1
+                    else snap.get("baseline_fail"))
+            _TAIL_METRICS["review_scope"] = review_scope_code(
+                repo_root, *_scope["scope"], files, fail)
+        except Exception as e:
+            debug_log(f"review scope telemetry skipped: {e}")
+    _scope = {}
+    if v2_metrics.get("dirty_now_count", -1) >= 0:
+        _note_scope(review_paths)
     if not review_paths:
         debug_log("Stop hook: empty review set")
         _skip(9, touched_paths_count=len(touched_paths))
@@ -2321,6 +2351,8 @@ def handle_stop_hook(input_data):
 
     # Filter out pre-existing content from file rewrites
     diff_files = filter_preexisting_from_diff(diff_files, cwd, baseline_sha)
+    if "scope" in _scope:
+        _note_scope([fp for fp, _ in diff_files])
 
     debug_log(f"Stop hook: reviewing {len(diff_files)} changed files (standard diff)")
 
@@ -2367,6 +2399,7 @@ def handle_stop_hook(input_data):
         ]
         # Update baseline so next stop hook iteration only sees new changes
         new_sha = None if is_subagent else capture_git_baseline(cwd)
+        new_base_fail = diffstate.last_baseline_fail
         new_untracked_baseline = _list_untracked(cwd) if new_sha else None
 
         def _record_fire(state):
@@ -2392,6 +2425,7 @@ def handle_stop_hook(input_data):
             if new_sha:
                 state["baseline_sha"] = new_sha
                 state["untracked_at_baseline"] = new_untracked_baseline
+                _store_baseline_fail(state, new_base_fail)
         with_locked_state(session_id, _record_fire)
 
         if new_sha:
