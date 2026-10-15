@@ -596,8 +596,8 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
     3P providers. Uses the same `output_format` JSON-schema contract so the
     return value shape is identical (parsed dict or None).
 
-    No tools (`allowed_tools=[]`) — the security review only needs structured
-    output, not Read/Grep/Glob. Single turn keeps cost predictable.
+    No tools (see _only_tools_args) — the security review only needs
+    structured output, not Read/Grep/Glob. Single turn keeps cost predictable.
     """
     global _last_call_claude_http_error
     _last_call_claude_http_error = None
@@ -645,6 +645,7 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
             system_prompt=CLAUDE_CODE_SYSTEM_PROMPT,
             cli_path=cli_path,
             allowed_tools=[],
+            extra_args=_only_tools_args(),
             setting_sources=[],
             max_turns=2,
             model=chosen_model,
@@ -1404,6 +1405,23 @@ def _send_sdk_logs_to_debug_log() -> None:
             sdk_logger.propagate = False
 
 
+# The agentic reviewer reads a diff it must not trust, so it gets
+# file-reading tools and nothing else.
+_REVIEWER_TOOLS = ("Read", "Grep", "Glob")
+
+
+def _only_tools_args(tools: Tuple[str, ...] = ()) -> Dict[str, Optional[str]]:
+    """extra_args that make `tools` the inner CLI's whole tool set.
+
+    allowed_tools only pre-approves tools. Without these flags the inner CLI
+    still offers every Claude Code tool (shell, file edits, web, subagents)
+    and any configured MCP server, and whether a call to one runs is left to
+    the permission mode that CLI starts in. Passed as CLI flags because not
+    every Agent SDK build that can run a review has a `tools` option.
+    """
+    return {"tools": ",".join(tools), "strict-mcp-config": None}
+
+
 def _agentic_spawn_env() -> Dict[str, str]:
     """opts.env for the SDK-spawned inner `claude` CLI.
 
@@ -1426,11 +1444,11 @@ def _agentic_spawn_env() -> Dict[str, str]:
         "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR": "",
         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "",
         "CLAUDE_CODE_INCLUDE_PARTIAL_MESSAGES": "",
-        # Neutralize git config/env hijack vectors so an allowlisted
-        # `git diff/log/show` cannot be turned into RCE via diff.external,
-        # core.pager, core.sshCommand, or an inherited GIT_* var. The agentic
-        # session only needs read-only history inspection; it never needs an
-        # external diff driver, a pager, or a remote.
+        # Neutralize git config/env hijack vectors so a `git diff/log/show`
+        # cannot be turned into RCE via diff.external, core.pager,
+        # core.sshCommand, or an inherited GIT_* var. The inner CLI has no
+        # shell tool (see _only_tools_args); this stays as a second line of
+        # defence should it ever run git.
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_EXTERNAL_DIFF": "",
@@ -1613,12 +1631,10 @@ def agentic_review(
             system_prompt=system,
             cwd=context_dir,
             cli_path=cli_path,
-            allowed_tools=["Read", "Grep", "Glob"],
-            # Read/Grep/Glob within cwd are auto-approved in default
-            # permission mode, so bypassPermissions is unnecessary (and
-            # would trip our own agent-permission-bypass guidance). Leaving
-            # permission_mode unset means an accidental future addition of
-            # a write/exec tool to allowed_tools is caught by the gate.
+            # Pre-approved, and the only tools the reviewer has: no
+            # permission mode can then let it write, run or fetch anything.
+            allowed_tools=list(_REVIEWER_TOOLS),
+            extra_args=_only_tools_args(_REVIEWER_TOOLS),
             setting_sources=[],
             max_turns=turns if turns is not None else max_turns,
             model=model,
