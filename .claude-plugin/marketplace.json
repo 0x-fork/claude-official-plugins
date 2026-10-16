@@ -180,7 +180,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/gemini-cli-extensions/alloydb-omni.git",
-        "sha": "ae7e42c4e428e303adcc96942f4fc35cb6b27d61"
+        "sha": "37101e3f9aaf0bd4d0acaeee540a0da2fd773d00"
       },
       "homepage": "https://github.com/gemini-cli-extensions/alloydb-omni"
     },
