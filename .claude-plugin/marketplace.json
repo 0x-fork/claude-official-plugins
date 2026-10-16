@@ -4154,7 +4154,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/explorium-ai/vibeprospecting-plugin.git",
-        "sha": "9b4067473305dbba80be0fa9a492be39b96f455e"
+        "sha": "ca43f6d92395462d8915dc31364bbce6a83e4006"
       },
       "homepage": "https://www.vibeprospecting.ai/product/claude-plugin"
     },
