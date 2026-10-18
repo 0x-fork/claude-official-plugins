@@ -193,10 +193,11 @@ MAX_STOP_HOOK_FIRINGS = int(os.environ.get("MAX_STOP_HOOK_FIRINGS", "3"))
 # diff; unbounded diffs burn tokens and risk 400 on context length.
 MAX_DIFF_FILES = int(os.environ.get("MAX_DIFF_FILES", "30"))
 
-# Changed paths past which the Stop review is skipped before any diff. A set
-# this large is a repo at $HOME or an unignored cache, not edits; no platform
-# takes that many paths in one git command, and only resolving them takes
-# seconds.
+# Changed source paths past which the Stop review is skipped before any diff.
+# A set this large is a repo at $HOME or an unignored cache, not edits; no
+# platform takes that many paths in one git command, and only resolving them
+# takes seconds. Paths the review never reads (an unignored node_modules) do
+# not count: they must not hide the one edited source file beside them.
 MAX_REVIEW_SET_PATHS = int(os.environ.get("MAX_REVIEW_SET_PATHS", "100000"))
 
 # Appended to all exit(2) guidance so the asyncRewake auto-turn doesn't
@@ -2273,7 +2274,9 @@ def handle_stop_hook(input_data):
         debug_log("Stop hook: empty review set")
         _skip(9, touched_paths_count=len(touched_paths))
     debug_log(f"Stop hook: review_set={len(review_paths)} base={diff_base[:12]} dirty_now={v2_metrics['dirty_now_count']} changed_since={v2_metrics['changed_since_count']}")
-    if len(review_paths) > MAX_REVIEW_SET_PATHS:
+    if (len(review_paths) > MAX_REVIEW_SET_PATHS
+            and sum(_is_reviewable_source(os.path.relpath(p, repo_root))
+                    for p in review_paths) > MAX_REVIEW_SET_PATHS):
         debug_log(f"Stop hook: pathological review set (more than "
                   f"{MAX_REVIEW_SET_PATHS} paths), skipping")
         _skip(8)
@@ -2288,7 +2291,8 @@ def handle_stop_hook(input_data):
     content_base = baseline_sha or diff_base
     diff_output = get_git_diff(repo_root, content_base, full_context=False,
                                paths=review_paths, untracked_paths=untracked)
-    if diff_output is None and content_base != diff_base:
+    if (diff_output is None and content_base != diff_base
+            and "gave_up" not in gitutil._path_list_too_long):
         debug_log(f"Stop hook: diff against {content_base[:12]} failed — falling back to {diff_base}")
         diff_output = get_git_diff(repo_root, diff_base, full_context=False,
                                    paths=review_paths, untracked_paths=untracked)
@@ -2298,6 +2302,12 @@ def handle_stop_hook(input_data):
         baseline_sha = "HEAD"
 
     if not diff_output or not diff_output.strip():
+        if "gave_up" in gitutil._path_list_too_long:
+            debug_log("Stop hook: changed paths do not fit the git commands, skipping")
+            _skip(8)
+        if "none_reviewable" in gitutil._path_list_too_long:
+            debug_log("Stop hook: no source code files among the changed paths")
+            _skip(7)
         debug_log("Stop hook: no changes since baseline")
         _skip(6)
 

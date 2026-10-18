@@ -26,6 +26,7 @@ def git_env(tmp_path, monkeypatch):
     d = tmp_path / "tmproot"
     d.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(d))
+    monkeypatch.setattr(gitutil, "_path_list_too_long", set())
     for k, v in GIT_ENV.items():
         monkeypatch.setenv(k, v)
 
@@ -40,8 +41,19 @@ def _more_than_one_command_holds(repo, exts):
         (deep / f"file_{i:05d}{exts[i % len(exts)]}").write_text("x\n")
 
 
+def _unusual_argument_limit():
+    """The long-path tests are sized for the usual limits: 1 MB (macOS) to
+    2 MB (Linux with an 8 MB stack)."""
+    try:
+        return not 1024 * 1024 <= os.sysconf("SC_ARG_MAX") <= 2 * 1024 * 1024 + 200000
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 long_paths = pytest.mark.skipif(
-    os.name == "nt", reason="needs paths longer than Windows allows by default")
+    os.name == "nt" or _unusual_argument_limit(),
+    reason="needs paths longer than Windows allows by default, and the usual "
+           "1 to 2 MB limit on one command's arguments")
 
 
 def _refuse_long_commands(monkeypatch, limit, error):
@@ -128,6 +140,70 @@ class TestGetGitDiff:
         assert cut.count("diff --git ") == 1
         assert gitutil.parse_diff_into_files(cut) == gitutil.parse_diff_into_files(whole)
 
+    def test_rename_away_from_a_secret_shaped_name_stays_out_after_a_refusal(
+            self, tmp_path, git_env, monkeypatch):
+        secret = "".join(f"KEY_{i}=value-{i}\n" for i in range(20))
+        repo = make_repo(tmp_path / "repo", {".env": secret, "app.py": "x = 1\n"})
+        os.rename(repo / ".env", repo / "settings.py")
+        (repo / "app.py").write_text("x = 2\n")
+        (repo / "a_much_longer_module_name.py").write_text("y = 1\n")
+        for i in range(20):
+            (repo / f"note{i:02d}.txt").write_text("x\n")
+        paths, base, root, untracked, _ = diffstate.compute_v2_review_set(str(repo), None, None, {})
+        whole = gitutil.get_git_diff(root, base, paths=paths, untracked_paths=untracked)
+        reviewed = ["a_much_longer_module_name.py", "app.py"]
+        assert sorted(f for f, _ in gitutil.parse_diff_into_files(whole)) == reviewed
+        # Room for .env beside each batch, and not for the three .py together.
+        monkeypatch.setattr(gitutil, "_MAX_PATH_ARGS_BYTES", 60)
+        ran = _refuse_long_commands(monkeypatch, GIT_CMD_CHARS + 120, OSError(errno.E2BIG, "too long"))
+        cut = gitutil.get_git_diff(root, base, paths=paths, untracked_paths=untracked)
+        diffs = [c for c in ran if "diff" in c]
+        assert len(diffs) > 1 and all(".env" in c for c in diffs)
+        assert sorted(f for f, _ in gitutil.parse_diff_into_files(cut)) == reviewed
+        assert "KEY_1=" not in "".join(d for _, d in gitutil.parse_diff_into_files(cut))
+
+    def test_gives_up_when_the_secret_shaped_paths_alone_are_too_many(
+            self, tmp_path, git_env, monkeypatch):
+        repo = make_repo(tmp_path / "repo", {
+            "app.py": "x = 1\n", **{f"dir{i:02d}/.env": "K=v\n" for i in range(20)}})
+        (repo / "app.py").write_text("x = 2\n")
+        for i in range(20):
+            os.remove(repo / f"dir{i:02d}" / ".env")
+        paths, base, root, untracked, _ = diffstate.compute_v2_review_set(str(repo), None, None, {})
+        monkeypatch.setattr(gitutil, "_MAX_PATH_ARGS_BYTES", 200)
+        ran = _refuse_long_commands(monkeypatch, GIT_CMD_CHARS + 100, OSError(errno.E2BIG, "too long"))
+        assert gitutil.get_git_diff(root, base, paths=paths, untracked_paths=untracked) is None
+        assert [c for c in ran if "diff" in c] == []
+        assert "gave_up" in gitutil._path_list_too_long
+
+    def test_secret_shaped_files_still_in_the_work_tree_do_not_ride_along(
+            self, tmp_path, git_env, monkeypatch):
+        repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
+        (repo / "app.py").write_text("x = 2\n")
+        for i in range(20):
+            (repo / f"dir{i:02d}").mkdir()
+            (repo / f"dir{i:02d}" / ".env").write_text("K=v\n")
+        paths, base, root, untracked, _ = diffstate.compute_v2_review_set(str(repo), None, None, {})
+        monkeypatch.setattr(gitutil, "_MAX_PATH_ARGS_BYTES", 200)
+        ran = _refuse_long_commands(monkeypatch, GIT_CMD_CHARS + 100, OSError(errno.E2BIG, "too long"))
+        cut = gitutil.get_git_diff(root, base, paths=paths, untracked_paths=untracked)
+        assert [f for f, _ in gitutil.parse_diff_into_files(cut)] == ["app.py"]
+        assert not any(".env" in a for c in ran for a in c)
+        assert not gitutil._path_list_too_long
+
+    def test_batches_shrink_to_a_lower_system_limit(self, monkeypatch):
+        monkeypatch.setattr(os, "sysconf", lambda name: 100000, raising=False)
+        budget = gitutil._path_args_budget({"A": "b" * 9997})
+        assert budget == 45000
+        paths = [f"dir/file_{i}.py" for i in range(10000)]
+        assert all(sum(len(p) + 9 for p in b) <= budget
+                   for b in gitutil._path_batches(paths, budget))
+        # Never above the platform figure, never uselessly small.
+        monkeypatch.setattr(os, "sysconf", lambda name: 10**9, raising=False)
+        assert gitutil._path_args_budget({}) == gitutil._MAX_PATH_ARGS_BYTES
+        monkeypatch.setattr(os, "sysconf", lambda name: 100, raising=False)
+        assert gitutil._path_args_budget({}) == 4096
+
     def test_gives_up_past_the_batch_limit(self, tmp_path, git_env, monkeypatch):
         root, base, paths, untracked = self._review_set(tmp_path)
         monkeypatch.setattr(gitutil, "_MAX_PATH_ARGS_BYTES", 60)
@@ -190,4 +266,49 @@ class TestWholeHook:
         assert m.get("skip_reason") == 8, m
         # The skip taken after a diff reports how many files the diff held.
         assert "diff_files_count" not in m
+        assert not stub_api.calls
+
+    def test_cap_counts_only_reviewable_paths(self, tmp_path, hook_env, stub_api):
+        repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
+        run_hook(ups_payload(repo), hook_env)
+        (repo / "app.py").write_text(VULN_PY)
+        for i in range(20):
+            (repo / f"note{i:02d}.txt").write_text("x\n")
+        rc, so, se = run_hook(stop_payload(repo), {**hook_env, "MAX_REVIEW_SET_PATHS": "5"})
+        m = metrics_of(so)
+        assert m.get("skip_reason") is None, m
+        assert m.get("review_set_count") == 21
+        assert stub_api.calls
+
+    @long_paths
+    def test_giving_up_is_reported_as_too_many_paths(self, tmp_path, hook_env, stub_api):
+        repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
+        run_hook(ups_payload(repo), hook_env)
+        (repo / "app.py").write_text(VULN_PY)
+        # 3,000 reviewable names of about 750 bytes: more than four commands.
+        _more_than_one_command_holds(repo, [".py"])
+        rc, so, se = run_hook(stop_payload(repo), hook_env)
+        m = metrics_of(so)
+        assert m.get("skip_reason") == 8, m
+        assert not stub_api.calls
+
+    @long_paths
+    def test_nothing_reviewable_is_reported_as_no_source_files(self, tmp_path, hook_env, stub_api):
+        repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
+        run_hook(ups_payload(repo), hook_env)
+        _more_than_one_command_holds(repo, [".txt"])
+        rc, so, se = run_hook(stop_payload(repo), hook_env)
+        m = metrics_of(so)
+        assert m.get("skip_reason") == 7, m
+        assert not stub_api.calls
+
+    def test_cap_reads_paths_from_the_repo_root(self, tmp_path, hook_env, stub_api):
+        # A directory above the repo named like a skipped one (build/) must
+        # not make every path look unreviewable.
+        repo = make_repo(tmp_path / "build" / "repo", {"app.py": "x = 1\n"})
+        run_hook(ups_payload(repo), hook_env)
+        (repo / "app.py").write_text(VULN_PY)
+        (repo / "new.py").write_text(VULN_PY)
+        rc, so, se = run_hook(stop_payload(repo), {**hook_env, "MAX_REVIEW_SET_PATHS": "1"})
+        assert metrics_of(so).get("skip_reason") == 8
         assert not stub_api.calls

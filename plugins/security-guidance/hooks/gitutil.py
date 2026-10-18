@@ -165,18 +165,42 @@ _MAX_PATH_ARGS_BYTES = (
 _MAX_PATH_BATCHES = 4
 
 
-def _path_batches(paths):
+def _arg_cost(path):
+    # The exec limit also counts a terminator and a pointer per argument.
+    return len(os.fsencode(path)) + 9
+
+
+def _path_args_budget(env=None):
+    """_MAX_PATH_ARGS_BYTES, or less where this system's own limit is lower
+    (a small stack limit, a BSD, a very large environment). Half of what the
+    system leaves after the environment, so the rest of the command fits."""
+    try:
+        arg_max = os.sysconf("SC_ARG_MAX")
+    except (AttributeError, ValueError, OSError):
+        return _MAX_PATH_ARGS_BYTES
+    env_bytes = sum(len(k) + len(v) + 2 for k, v in (env or os.environ).items())
+    return min(_MAX_PATH_ARGS_BYTES, max(4096, (arg_max - env_bytes) // 2))
+
+
+def _path_batches(paths, budget=None):
+    if budget is None:
+        budget = _MAX_PATH_ARGS_BYTES
     batch, size = [], 0
     for p in paths:
-        # The exec limit also counts a terminator and a pointer per argument.
-        n = len(os.fsencode(p)) + 9
-        if batch and size + n > _MAX_PATH_ARGS_BYTES:
+        n = _arg_cost(p)
+        if batch and size + n > budget:
             yield batch
             batch, size = [], 0
         batch.append(p)
         size += n
     if batch:
         yield batch
+
+
+# Why a path list too long for one command left the last get_git_diff call
+# without a diff, for the Stop review's skip reason: "gave_up" (still too
+# long once cut down) or "none_reviewable".
+_path_list_too_long = set()
 
 
 def _too_many_args(e):
@@ -196,9 +220,13 @@ def _run_git_on_review_paths(args, paths, timeout, **kwargs):
     those need more than _MAX_PATH_BATCHES commands, the refusal is raised
     again.
 
-    After a refusal, `git diff` pairs a rename only when both of its paths
-    are reviewable source and in the same command; otherwise it shows as a
-    delete or an add.
+    Secret-shaped paths that are gone from the work tree go into every one
+    of those commands: `git diff` must still pair a rename away from such a
+    name, or the secret's content would show as a new source file. A new file
+    that only resembles the secret may be paired with it too and left out of
+    the review. Any other rename is paired only when both of its paths are
+    reviewable source and in the same command; otherwise it shows as a delete
+    or an add.
     """
     cmd = [*GIT_CMD, *args, "--"]
     paths = list(paths)
@@ -210,11 +238,20 @@ def _run_git_on_review_paths(args, paths, timeout, **kwargs):
         if not _too_many_args(e):
             raise
         too_long = e
-    batches = list(_path_batches([p for p in paths if _is_reviewable_source(p)]))
+    budget = _path_args_budget(kwargs.get("env"))
+    batches = list(_path_batches(
+        [p for p in paths if _is_reviewable_source(p)], budget))
+    root = kwargs.get("cwd") or os.getcwd()
+    secret = [p for p in paths if _is_secret_shaped(p)
+              and not os.path.lexists(os.path.join(root, p))]
     debug_log(f"git {args[0]}: {len(paths)} paths do not fit one command; "
               f"{len(batches)} command(s) for the reviewable ones")
-    if len(batches) > _MAX_PATH_BATCHES:
+    # The secret-shaped paths ride along with every batch, so they get a
+    # small share of a command of their own.
+    if (len(batches) > _MAX_PATH_BATCHES
+            or sum(map(_arg_cost, secret)) > budget // 4):
         raise too_long
+    cmd += secret
     results = []
     for batch in batches:
         left = deadline - time.monotonic()
@@ -856,6 +893,7 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
     `untracked_paths` (repo-root-relative) is forwarded to _temp_index so it
     can add only those files instead of scanning the whole worktree.
     """
+    _path_list_too_long.clear()
     pathspec = _diff_pathspec(cwd, paths)
     if paths and not pathspec:
         # Caller restricted to specific paths but none are inside this repo
@@ -872,6 +910,8 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
             results = _run_git_on_review_paths(args, pathspec[1:], timeout=30, cwd=cwd, env=env)
         else:
             results = [subprocess.run([*GIT_CMD, *args], cwd=cwd, capture_output=True, timeout=30, env=env)]
+        if not results:
+            _path_list_too_long.add("none_reviewable")
         for result in results:
             if result.returncode != 0:
                 debug_log(f"git diff failed: {result.stderr[:200].decode('utf-8', errors='replace')}")
@@ -890,6 +930,8 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
             return _run(env)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         debug_log(f"git diff error: {e}")
+        if isinstance(e, OSError) and _too_many_args(e):
+            _path_list_too_long.add("gave_up")
         return None
 
 
