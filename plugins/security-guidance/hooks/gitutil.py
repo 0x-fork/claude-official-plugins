@@ -44,6 +44,13 @@ GIT_CMD = [
     # content same) rewrites the index under index.lock, GIT_OPTIONAL_LOCKS or
     # not. Off, every diff here only reads the index, so none needs a copy.
     "-c", "diff.autoRefreshIndex=false",
+    # The diff parsers read `diff --git a/<old> b/<new>` headers. A user's
+    # diff.mnemonicPrefix (c/ w/ i/), diff.noprefix or diff.srcPrefix /
+    # diff.dstPrefix changes that shape, and every file would be dropped.
+    "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.srcPrefix=a/",
+    "-c", "diff.dstPrefix=b/",
 ]
 
 SAFE_GIT_CONFIG = (
@@ -937,6 +944,77 @@ SKIP_FILE_SUFFIXES = (
     '.lock', '_pb2.py', '.pb.go',
 )
 
+# Files that hold secrets by naming convention are never sent for review. The
+# review covers everything dirty in the work tree, including files the user
+# changed and Claude never opened, so a key file or an encrypted dotfile source
+# would otherwise leave the machine in the review request. The list is kept to
+# names that are secret stores by convention; ordinary source such as
+# `private_api.py` or `id_generator.py` stays reviewable.
+_SSH_PRIVATE_KEY_BASENAMES = frozenset((
+    'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ecdsa_sk', 'id_ed25519',
+    'id_ed25519_sk', 'id_xmss',
+))
+_PRIVATE_KEY_NAME_SUFFIXES = ('_rsa', '_dsa', '_ecdsa', '_ed25519')
+_CREDENTIAL_BASENAMES = frozenset((
+    'credentials', '.netrc', '.pgpass', '.npmrc', '.pypirc',
+    '.git-credentials', '.dockercfg',
+))
+# chezmoi encodes a target file's attributes as stacked name prefixes
+# (`private_dot_netrc`, `encrypted_private_token`); `dot_` stands for a
+# leading dot.
+_CHEZMOI_ATTR_PREFIXES = (
+    'after_', 'before_', 'create_', 'empty_', 'encrypted_', 'exact_',
+    'executable_', 'external_', 'literal_', 'modify_', 'once_', 'onchange_',
+    'private_', 'readonly_', 'remove_', 'run_', 'symlink_',
+)
+# An `encrypted_` source keeps its target's name, so `encrypted_store.py` could
+# be either ciphertext or code about encryption. Treat it as ciphertext only
+# when it has no extension or a data-file one.
+_ENCRYPTED_DATA_EXTENSIONS = frozenset((
+    '', '.json', '.yaml', '.yml', '.toml', '.properties', '.tfvars',
+))
+
+
+# Paths skipped as secret-shaped during this hook run. The Stop hook reports
+# the count (never the names) so the skip can be watched in telemetry.
+_secret_shaped_skipped = set()
+
+
+def _skip_secret_shaped(file_path):
+    if not _is_secret_shaped(file_path):
+        return False
+    _secret_shaped_skipped.add(file_path)
+    return True
+
+
+def _is_secret_shaped(file_path):
+    base = os.path.basename(file_path.replace("\\", "/")).lower()
+    target = base
+    encrypted = False
+    stripped = True
+    while stripped:
+        stripped = False
+        for prefix in _CHEZMOI_ATTR_PREFIXES:
+            if target.startswith(prefix) and len(target) > len(prefix):
+                target = target[len(prefix):]
+                encrypted = encrypted or prefix == 'encrypted_'
+                stripped = True
+                break
+    if target.startswith('dot_'):
+        target = '.' + target[4:]
+    ext = os.path.splitext(target)[1]
+    if encrypted and ext in _ENCRYPTED_DATA_EXTENSIONS:
+        return True
+    for name in {base, target}:
+        if name.startswith('.env'):
+            return True
+        if name in _SSH_PRIVATE_KEY_BASENAMES or name in _CREDENTIAL_BASENAMES:
+            return True
+        if '.' not in name and name.endswith(_PRIVATE_KEY_NAME_SUFFIXES):
+            return True
+    return False
+
+
 # Path tokens that bump a file's review priority when a commit exceeds
 # MAX_DIFF_FILES and we have to pick a subset. These are exactly the surfaces
 # single-shot and agentic reviews disagree on most (auth, routing, IPC,
@@ -1014,6 +1092,8 @@ def _is_reviewable_source(file_path):
     norm = "/" + file_path.replace("\\", "/")
     if any(("/" + p) in norm for p in SKIP_PATH_PATTERNS):
         return False
+    if _skip_secret_shaped(file_path):
+        return False
     if file_path.endswith(SKIP_FILE_SUFFIXES):
         return False
     ext = os.path.splitext(file_path)[1].lower()
@@ -1043,32 +1123,103 @@ def _is_reviewable_source(file_path):
     return False
 
 
+# A file's section starts at a `diff --git ` line. Inside a section every line
+# of file content carries a `+`, `-` or space prefix, so only a real header can
+# start a line with it; source text that merely contains the words cannot.
+_DIFF_SECTION_RE = re.compile(r'^diff --git ', re.MULTILINE)
+_UNQUOTED_HEADER_RE = re.compile(r'^a/(.+?) b/(.+)$')
+_C_ESCAPES = {
+    'a': b'\a', 'b': b'\b', 'f': b'\f', 'n': b'\n', 'r': b'\r', 't': b'\t',
+    'v': b'\v', '\\': b'\\', '"': b'"',
+}
+
+
+def _read_quoted_path(text, start):
+    """Decode the C-quoted path whose opening quote is at text[start].
+    Returns (path, index after the closing quote), or None if unterminated."""
+    out = bytearray()
+    i = start + 1
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            return out.decode("utf-8", errors="replace"), i + 1
+        if c == '\\' and i + 1 < len(text):
+            n = text[i + 1]
+            if n in _C_ESCAPES:
+                out += _C_ESCAPES[n]
+                i += 2
+                continue
+            octal = re.match(r'[0-7]{1,3}', text[i + 1:i + 4])
+            if octal:
+                out.append(int(octal.group(0), 8) & 0xFF)
+                i += 1 + len(octal.group(0))
+                continue
+        out += c.encode("utf-8")
+        i += 1
+    return None
+
+
+def _parse_diff_header(header):
+    """(old_path, new_path) from the text after `diff --git `, or None.
+
+    core.quotePath=false keeps non-ASCII names raw, but git still C-quotes a
+    name that contains a double quote, a backslash or a control character:
+    `"a/we\\"ird.py" "b/we\\"ird.py"`. Either side can be quoted on its own.
+    """
+    old = new = None
+    if header.startswith('"'):
+        first = _read_quoted_path(header, 0)
+        if not first:
+            return None
+        old, end = first
+        rest = header[end:].lstrip(' ')
+        if rest.startswith('"'):
+            second = _read_quoted_path(rest, 0)
+            new = second[0] if second else None
+        else:
+            new = rest
+    elif header.endswith('"') and ' "b/' in header:
+        split_at = header.index(' "b/')
+        old = header[:split_at]
+        second = _read_quoted_path(header, split_at + 1)
+        new = second[0] if second else None
+    else:
+        m = _UNQUOTED_HEADER_RE.match(header)
+        return (m.group(1), m.group(2)) if m else None
+    if not old or not new or not old.startswith('a/') or not new.startswith('b/'):
+        return None
+    return old[2:], new[2:]
+
+
+# Section headers that could not be parsed during this hook run; that file is
+# left out of the review. The Stop hook reports the count so a header shape
+# this parser misses shows up in telemetry instead of passing silently.
+_unparsed_diff_headers = set()
+
+
+def _iter_diff_sections(diff_output):
+    """Yield (new_path, old_path, lines after the header line) per file section."""
+    for section in _DIFF_SECTION_RE.split(diff_output)[1:]:
+        lines = section.split('\n')
+        paths = _parse_diff_header(lines[0])
+        if paths:
+            yield paths[1] or paths[0], paths[0], lines[1:]
+        else:
+            _unparsed_diff_headers.add(lines[0])
+
+
 def extract_file_paths_from_diff(diff_output):
     """
     Extract file paths from unified diff output (without content).
     Only includes files with source code extensions.
-    Returns a list of file paths.
     """
     if not diff_output or not diff_output.strip():
         return []
 
-    paths = []
-    file_diffs = diff_output.split("diff --git ")
-
-    for file_diff in file_diffs:
-        if not file_diff.strip():
-            continue
-        lines = file_diff.split('\n')
-        header_match = re.match(r'^a/(.+?) b/(.+)$', lines[0])
-        if not header_match:
-            continue
-        file_path = header_match.group(2) or header_match.group(1) or ''
-        if not _is_reviewable_source(file_path):
-            continue
-        paths.append(file_path)
-
-    return paths
-
+    return [
+        file_path for file_path, old_path, _ in _iter_diff_sections(diff_output)
+        if _is_reviewable_source(file_path) and not _skip_secret_shaped(old_path)
+    ]
 
 
 def parse_diff_into_files(diff_output):
@@ -1080,28 +1231,16 @@ def parse_diff_into_files(diff_output):
         return []
 
     files = []
-    file_diffs = diff_output.split("diff --git ")
-
-    for file_diff in file_diffs:
-        if not file_diff.strip():
-            continue
-
-        # Extract filename from first line: "a/path/to/file b/path/to/file"
-        lines = file_diff.split('\n')
-        header_match = re.match(r'^a/(.+?) b/(.+)$', lines[0])
-        if not header_match:
-            continue
-
-        file_path = header_match.group(2) or header_match.group(1) or ''
-
-        # Filter to source code files only
-        if not _is_reviewable_source(file_path):
+    for file_path, old_path, lines in _iter_diff_sections(diff_output):
+        # Filter to source code files only. A rename away from a secret-shaped
+        # name still carries the secret's content, so the old name counts too.
+        if not _is_reviewable_source(file_path) or _skip_secret_shaped(old_path):
             continue
 
         # Extract the diff content (from first @@ onwards)
         diff_lines = []
         in_hunks = False
-        for line in lines[1:]:
+        for line in lines:
             if line.startswith('@@'):
                 in_hunks = True
             if in_hunks:

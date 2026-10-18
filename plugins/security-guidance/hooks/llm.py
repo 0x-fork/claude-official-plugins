@@ -20,11 +20,15 @@ Two reassignable globals here are read by handlers in
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
+import traceback
+import urllib.parse
 import urllib.request
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -153,6 +157,24 @@ CLAUDE_CODE_SYSTEM_PROMPT = "You are a Claude agent, built on Anthropic's Claude
 # each call. None = no error; int = HTTP status code; -1 = network/timeout;
 _last_call_claude_http_error = None
 
+# Outcome of this thread's last analyze_code_security call. Per thread because
+# the commit review's race runs that call on a thread of its own.
+_review_status = threading.local()
+
+
+def last_review_failed() -> bool:
+    """True when this thread's last analyze_code_security call got no verdict
+    from the model (every call failed, or the reply could not be read), which
+    a caller must not treat as "nothing found"."""
+    return getattr(_review_status, "failed", False)
+
+
+def last_review_status() -> Optional[int]:
+    """A copy of the module-wide _last_call_claude_http_error, taken when this
+    thread's last analyze_code_security call got no verdict (an overlapping call
+    on another thread can change the global); None if the reply was unreadable."""
+    return getattr(_review_status, "status", None)
+
 
 # =====================================================================
 # Outbound connectivity probe
@@ -267,6 +289,56 @@ def _cap_files_for_prompt(files):
 _auth_prefer_token = False
 
 
+# A valid HTTP header name (an RFC 9110 token).
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_custom_header_lines_skipped = set()
+
+
+def _custom_headers() -> List[Tuple[str, str]]:
+    """ANTHROPIC_CUSTOM_HEADERS as (name, value) pairs, parsed the way Claude
+    Code parses it: one `Name: Value` per line, split at the first colon,
+    trimmed, lines with no name dropped. Lines http.client cannot send (an
+    invalid name, a carriage return or non-Latin-1 text in the value) are
+    skipped. Values are never logged: they are often credentials."""
+    pairs = []
+    raw = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+    for number, line in enumerate(re.split(r"\r?\n", raw), 1):
+        name, sep, value = line.partition(":")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            continue
+        try:
+            value.encode("latin-1")
+            sendable = bool(_HEADER_NAME.fullmatch(name)) and "\r" not in value
+        except UnicodeEncodeError:
+            sendable = False
+        if not sendable:
+            if number not in _custom_header_lines_skipped:
+                _custom_header_lines_skipped.add(number)
+                debug_log(f"ANTHROPIC_CUSTOM_HEADERS: skipped line {number}, not a valid HTTP header")
+            continue
+        pairs.append((name, value))
+    return pairs
+
+
+def gateway_cfg() -> int:
+    """How the plugin's own API calls are routed, for telemetry: bit 1 when
+    ANTHROPIC_BASE_URL names a host other than api.anthropic.com, bit 2 when
+    at least one ANTHROPIC_CUSTOM_HEADERS line is sent. 0 when neither. A
+    number only: no host, header name or value."""
+    cfg = 0
+    base = _anthropic_base_url()
+    try:
+        host = (urllib.parse.urlsplit(base).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if base and host != "api.anthropic.com":
+        cfg |= 1
+    if any(name.lower() != "anthropic-beta" for name, _ in _custom_headers()):
+        cfg |= 2
+    return cfg
+
+
 def _build_auth_headers(use_token, betas=("structured-outputs-2025-11-13",)):
     betas = list(betas)
     headers = {
@@ -278,6 +350,18 @@ def _build_auth_headers(use_token, betas=("structured-outputs-2025-11-13",)):
         betas.append("oauth-2025-04-20")
     else:
         headers["x-api-key"] = ANTHROPIC_API_KEY
+    for name, value in _custom_headers():
+        lowered = name.lower()
+        if lowered == "anthropic-beta":
+            # Not sent: the review needs none of the user's betas, and Claude
+            # Code drops anthropic-beta lines when the organization's
+            # compliance policy disables experimental betas.
+            continue
+        # As in Claude Code, a custom line wins over a header of the same
+        # name that the plugin set, including the credential header.
+        for existing in [k for k in headers if k.lower() == lowered]:
+            del headers[existing]
+        headers[name] = value
     if betas:
         headers["anthropic-beta"] = ",".join(betas)
     return headers
@@ -512,8 +596,8 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
     3P providers. Uses the same `output_format` JSON-schema contract so the
     return value shape is identical (parsed dict or None).
 
-    No tools (`allowed_tools=[]`) — the security review only needs structured
-    output, not Read/Grep/Glob. Single turn keeps cost predictable.
+    No tools (see _only_tools_args) — the security review only needs
+    structured output, not Read/Grep/Glob. Single turn keeps cost predictable.
     """
     global _last_call_claude_http_error
     _last_call_claude_http_error = None
@@ -546,6 +630,7 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
             _record_http_error(-1)
             return None
 
+    _send_sdk_logs_to_debug_log()
     cli_path = os.environ.get("SG_AGENTIC_CLI_PATH") or None
     default_model = default_review_model()
     chosen_model = model or default_model
@@ -560,6 +645,7 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
             system_prompt=CLAUDE_CODE_SYSTEM_PROMPT,
             cli_path=cli_path,
             allowed_tools=[],
+            extra_args=_only_tools_args(),
             setting_sources=[],
             max_turns=2,
             model=chosen_model,
@@ -1111,7 +1197,11 @@ def analyze_code_security(files: List[Tuple[str, str]], is_diff: bool = False, p
     previous_findings: list of category strings from earlier stop hook firings this turn,
         used to prompt the reviewer to verify those issues were actually fixed.
     Returns (formatted guidance string or None, list of vuln dicts with severity/category).
+    Also returns (None, []) when the model gave no verdict; last_review_failed()
+    tells the two apart.
     """
+    _review_status.failed = False
+    _review_status.status = None
     if not HAS_API_CREDENTIALS or not files:
         return None, []
 
@@ -1229,11 +1319,21 @@ Respond with a JSON object. If vulnerabilities are found, set hasVulnerabilities
     }
 
     prompt += extensibility.guidance_block()
-    analysis = _call_claude_dual_or(prompt, output_schema,
-                                    bool_key="hasVulnerabilities",
-                                    list_key="vulnerabilities",
-                                    cacheable_prefix=_CODE_REVIEW_RUBRIC)
-    if not analysis or not analysis.get("hasVulnerabilities") or not analysis.get("vulnerabilities"):
+    try:
+        analysis = _call_claude_dual_or(prompt, output_schema,
+                                        bool_key="hasVulnerabilities",
+                                        list_key="vulnerabilities",
+                                        cacheable_prefix=_CODE_REVIEW_RUBRIC)
+    except Exception as e:
+        debug_log(f"LLM code review: call raised {type(e).__name__}: {e}")
+        analysis = None
+    # A reply without the schema's required flag is not a verdict either.
+    if not isinstance(analysis, dict) or "hasVulnerabilities" not in analysis:
+        _review_status.failed = True
+        _review_status.status = _last_call_claude_http_error
+        debug_log("LLM code review: no verdict from the model")
+        return None, []
+    if not analysis.get("hasVulnerabilities") or not analysis.get("vulnerabilities"):
         debug_log("LLM code review: no vulnerabilities found")
         return None, []
 
@@ -1279,6 +1379,49 @@ _FINDINGS_SCHEMA = review_api.FINDINGS_SCHEMA
 _SURVIVED_SCHEMA = review_api.SURVIVED_SCHEMA
 
 
+class _DebugLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            text = record.getMessage()
+            if record.exc_info:
+                text += " | " + "".join(
+                    traceback.format_exception_only(*record.exc_info[:2])).strip()
+        except Exception:
+            return  # never handleError(): it prints to stderr
+        debug_log(f"agent sdk: {text}")
+
+
+_sdk_log_lock = threading.Lock()
+
+
+def _send_sdk_logs_to_debug_log() -> None:
+    """Route the Agent SDK's own log records to the debug log, and stop them
+    propagating. With no handler, Python prints its errors to this hook's
+    stderr, which Claude Code shows Claude as the review notice."""
+    sdk_logger = logging.getLogger("claude_agent_sdk")
+    with _sdk_log_lock:
+        if not any(isinstance(h, _DebugLogHandler) for h in sdk_logger.handlers):
+            sdk_logger.addHandler(_DebugLogHandler())
+            sdk_logger.propagate = False
+
+
+# The agentic reviewer reads a diff it must not trust, so it gets
+# file-reading tools and nothing else.
+_REVIEWER_TOOLS = ("Read", "Grep", "Glob")
+
+
+def _only_tools_args(tools: Tuple[str, ...] = ()) -> Dict[str, Optional[str]]:
+    """extra_args that make `tools` the inner CLI's whole tool set.
+
+    allowed_tools only pre-approves tools. Without these flags the inner CLI
+    still offers every Claude Code tool (shell, file edits, web, subagents)
+    and any configured MCP server, and whether a call to one runs is left to
+    the permission mode that CLI starts in. Passed as CLI flags because not
+    every Agent SDK build that can run a review has a `tools` option.
+    """
+    return {"tools": ",".join(tools), "strict-mcp-config": None}
+
+
 def _agentic_spawn_env() -> Dict[str, str]:
     """opts.env for the SDK-spawned inner `claude` CLI.
 
@@ -1301,11 +1444,11 @@ def _agentic_spawn_env() -> Dict[str, str]:
         "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR": "",
         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "",
         "CLAUDE_CODE_INCLUDE_PARTIAL_MESSAGES": "",
-        # Neutralize git config/env hijack vectors so an allowlisted
-        # `git diff/log/show` cannot be turned into RCE via diff.external,
-        # core.pager, core.sshCommand, or an inherited GIT_* var. The agentic
-        # session only needs read-only history inspection; it never needs an
-        # external diff driver, a pager, or a remote.
+        # Neutralize git config/env hijack vectors so a `git diff/log/show`
+        # cannot be turned into RCE via diff.external, core.pager,
+        # core.sshCommand, or an inherited GIT_* var. The inner CLI has no
+        # shell tool (see _only_tools_args); this stays as a second line of
+        # defence should it ever run git.
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_EXTERNAL_DIFF": "",
@@ -1327,13 +1470,46 @@ def _agentic_spawn_env() -> Dict[str, str]:
     return env
 
 
+# The tools the agentic reviewer is given to look around the repo.
+_REVIEWER_FILE_TOOLS = ("Read", "Grep", "Glob")
+
+
+def _agentic_context_dir(repo_dir: str) -> str:
+    """The directory the agentic reviewer runs in."""
+    return os.environ.get("SG_AGENTIC_CONTEXT_DIR") or repo_dir
+
+
 def agentic_review(
     repo_dir: str, diff_files: List[Tuple[str, str]], touched_paths: List[str],
+) -> Tuple[Optional[str], List[Dict[str, Any]], Dict[str, Any]]:
+    """Run the two-stage agentic review (_agentic_review) and add reviewer
+    context diagnostics to its metrics. Counts only, no paths:
+
+      rv_cwd_gone    1 = the directory the reviewer runs in was missing
+                     before the review, 2 = it went missing during it
+      rv_tool_err    Read/Grep/Glob calls that came back as errors
+      rv_tool_calls  Read/Grep/Glob calls made
+
+    The counts cover all stages of the review. Keys are left out when 0."""
+    context_dir = _agentic_context_dir(repo_dir)
+    gone = 0 if os.path.isdir(context_dir) else 1
+    ctx = {"rv_tool_err": 0, "rv_tool_calls": 0}
+    guidance, vulns, metrics = _agentic_review(repo_dir, diff_files, touched_paths, ctx)
+    if not gone and not os.path.isdir(context_dir):
+        gone = 2
+    ctx_m = {"rv_cwd_gone": gone, **ctx}
+    return guidance, vulns, {**metrics, **{k: v for k, v in ctx_m.items() if v}}
+
+
+def _agentic_review(
+    repo_dir: str, diff_files: List[Tuple[str, str]], touched_paths: List[str],
+    ctx: Dict[str, int],
 ) -> Tuple[Optional[str], List[Dict[str, Any]], Dict[str, Any]]:
     """Two-stage Agent-SDK review: investigate (Read/Grep/Glob over the repo)
     then a self-refute filter pass. Returns (guidance_or_None, vulns,
     metrics). On SDK unavailability returns (None, [], {"agentic_fallback":
-    reason}) so the caller can fall back to the single-shot path."""
+    reason}) so the caller can fall back to the single-shot path. Adds to
+    the `ctx` counters (see agentic_review) as the reviewer makes tool calls."""
     import time as _t
 
     # Note: do NOT pop ANTHROPIC_AUTH_TOKEN from os.environ here. The race
@@ -1377,6 +1553,7 @@ def agentic_review(
             debug_log(f"agentic_review: SDK unavailable ({e}); falling back")
             return None, [], {"agentic_fallback": f"import:{type(e).__name__}"}
 
+    _send_sdk_logs_to_debug_log()
     # Overridable via SG_AGENTIC_MODEL.
     model = os.environ.get("SG_AGENTIC_MODEL") or _CLI_OPUS_ALIAS
     max_turns = int(os.environ.get("SG_AGENTIC_MAX_TURNS", "18"))
@@ -1384,7 +1561,7 @@ def agentic_review(
     # eval harness it's a temp dir with ONLY touched_paths — the agent can't
     # trace cross-file data flow. The harness sets SG_AGENTIC_CONTEXT_DIR to a
     # full repo (worktree at the commit, or the live clone at HEAD).
-    context_dir = os.environ.get("SG_AGENTIC_CONTEXT_DIR") or repo_dir
+    context_dir = _agentic_context_dir(repo_dir)
     context_note = ""
     if context_dir != repo_dir:
         context_note = (
@@ -1461,6 +1638,21 @@ def agentic_review(
         except Exception:
             pass
 
+    # Without a callback the inner CLI writes to this hook's stderr, which
+    # Claude Code shows Claude as the review notice. Log it instead.
+    child_stderr_lines = [0]
+
+    def _child_stderr_metric() -> Dict[str, int]:
+        return {"child_stderr": child_stderr_lines[0]} if child_stderr_lines[0] else {}
+
+    def _on_child_stderr(line: str) -> None:
+        child_stderr_lines[0] += 1
+        metrics["child_stderr"] = child_stderr_lines[0]
+        if child_stderr_lines[0] <= 20:
+            debug_log(f"agentic reviewer's CLI stderr | {str(line).rstrip()}")
+        elif child_stderr_lines[0] == 21:
+            debug_log("agentic reviewer's CLI stderr | (further lines not logged)")
+
     async def _arun(system: str, prompt: str, *, schema: Dict[str, Any],
                     turns: Optional[int] = None
                     ) -> Tuple[Optional[Dict[str, Any]], int, Optional[str]]:
@@ -1472,12 +1664,10 @@ def agentic_review(
             system_prompt=system,
             cwd=context_dir,
             cli_path=cli_path,
-            allowed_tools=["Read", "Grep", "Glob"],
-            # Read/Grep/Glob within cwd are auto-approved in default
-            # permission mode, so bypassPermissions is unnecessary (and
-            # would trip our own agent-permission-bypass guidance). Leaving
-            # permission_mode unset means an accidental future addition of
-            # a write/exec tool to allowed_tools is caught by the gate.
+            # Pre-approved, and the only tools the reviewer has: no
+            # permission mode can then let it write, run or fetch anything.
+            allowed_tools=list(_REVIEWER_TOOLS),
+            extra_args=_only_tools_args(_REVIEWER_TOOLS),
             setting_sources=[],
             max_turns=turns if turns is not None else max_turns,
             model=model,
@@ -1517,6 +1707,7 @@ def agentic_review(
             # the review run end-to-end; the others are belt-and-suspenders
             # for the same fd-passing pattern.
             env=_agentic_spawn_env(),
+            stderr=_on_child_stderr,
         )
         n = 0
         structured: Optional[Dict[str, Any]] = None
@@ -1533,9 +1724,16 @@ def agentic_review(
             yield {"type": "user",
                    "message": {"role": "user", "content": prompt}}
 
+        # Blocks are matched by shape so older SDK builds need no extra import.
+        file_tool_ids = set()
         async for msg in query(prompt=_once(), options=opts):
             if isinstance(msg, AssistantMessage):
                 n += 1
+                for b in getattr(msg, "content", None) or []:
+                    if (getattr(b, "name", None) in _REVIEWER_FILE_TOOLS
+                            and getattr(b, "id", None)):
+                        file_tool_ids.add(b.id)
+                        ctx["rv_tool_calls"] += 1
             elif isinstance(msg, ResultMessage):
                 subtype = msg.subtype
                 if msg.structured_output is not None:
@@ -1545,6 +1743,15 @@ def agentic_review(
                 # the price-table estimate. getattr guards older SDK builds.
                 _record_usage(getattr(msg, "usage", None) or {}, model,
                               cost_usd=getattr(msg, "total_cost_usd", None))
+            else:
+                # Tool results come back as user messages.
+                content = getattr(msg, "content", None)
+                if isinstance(content, list):
+                    ctx["rv_tool_err"] += sum(
+                        1 for b in content
+                        if getattr(b, "is_error", None) is True
+                        and getattr(b, "tool_use_id", None) in file_tool_ids
+                    )
         return structured, n, subtype
 
     def _run(system: str, prompt: str, *, schema: Dict[str, Any]
@@ -1568,12 +1775,14 @@ def agentic_review(
                          f"{json.dumps(inv, indent=2) if inv else '<none>'}")
     except Exception as e:
         debug_log(f"agentic_review: investigate failed ({e}); falling back")
-        return None, [], {"agentic_fallback": f"investigate:{type(e).__name__}"}
+        return None, [], {"agentic_fallback": f"investigate:{type(e).__name__}",
+                          **_child_stderr_metric()}
     metrics["investigate_ms"] = int((_t.time() - t0) * 1000)
     metrics["investigate_turns"] = inv_turns
     if inv is None:
         reason = inv_subtype or "no_structured_output"
-        return None, [], {"agentic_fallback": f"investigate:{reason}"}
+        return None, [], {"agentic_fallback": f"investigate:{reason}",
+                          **_child_stderr_metric()}
     # Keep medium-severity candidates through self-refute — that pass is the
     # real precision gate, and the model's investigate-stage severity rating
     # is conservative (it defaults to "medium"). Filtering to high/critical
