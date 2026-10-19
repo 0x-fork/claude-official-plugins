@@ -106,7 +106,13 @@ class TestScope:
         _, repo = workspace
         m = _turn(repo, hook_env, edits=[str(repo / "a\ud800b.py"), repo / "app.py"],
                   during=lambda: (repo / "app.py").write_text(VULN_PY))
-        assert m["files_reviewed"] == 1 and "review_scope" not in m
+        assert m["files_reviewed"] == 1
+        if os.name == "nt":
+            # Windows paths can hold a lone surrogate: it is one more file
+            # in the repo.
+            assert m["review_scope"] == 10000
+        else:
+            assert "review_scope" not in m
 
 
 class TestSnapshot:
