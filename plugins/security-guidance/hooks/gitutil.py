@@ -18,6 +18,8 @@ import contextlib
 import os
 import re
 import subprocess
+import tempfile
+import threading
 
 from _base import debug_log
 
@@ -767,6 +769,181 @@ def _is_ancestor(cwd, maybe_ancestor, descendant):
 
 
 
+def _file_diff_cap():
+    try:
+        n = int(os.environ.get("SG_MAX_FILE_DIFF_BYTES", ""))
+    except ValueError:
+        return 4 * 1024 * 1024
+    return max(n, _LATE_FILE_DIFF_BYTES)
+
+
+_LATE_FILE_DIFF_BYTES = 64 * 1024
+# How much of one file's diff the Stop review keeps while it reads git's
+# output. The review prompt takes far less of a file (DIFF_PER_FILE_BYTES);
+# the rest is room for filter_preexisting_from_diff, which needs the removed
+# and the added side of a rewritten file, so a rewrite keeps both sides for
+# files up to about half of this.
+MAX_FILE_DIFF_BYTES = _file_diff_cap()
+# Past this much kept in total, each further file keeps only its start.
+MAX_KEPT_DIFF_BYTES = 4 * MAX_FILE_DIFF_BYTES
+_SECTION_MARK = b"\ndiff --git "
+_MAX_HEADER_BYTES = 64 * 1024
+
+# What the last get_git_diff read, for the Stop hook's metrics: bytes of git
+# output, reviewable files whose diff was cut and the bytes cut from them,
+# and diffs that hit the timeout during this hook run.
+_diff_read = {"bytes": 0, "cut_files": 0, "cut_bytes": 0, "timeouts": 0}
+
+
+class _DiffKeeper:
+    """Takes `git diff` output as it arrives and keeps only what the review
+    can use: the header line of every file, and up to MAX_FILE_DIFF_BYTES of
+    each file parse_diff_into_files would keep. A turn that wrote large data
+    files no longer puts their whole diff in memory."""
+
+    def __init__(self):
+        self.parts = []
+        self.kept = 0
+        self.seen = 0
+        self.cut_files = 0
+        self.cut_bytes = 0
+        # Unhandled input. Starts as a newline that is not git's, so a header
+        # at the very start of the output is found like any other.
+        self._pending = b"\n"
+        self._at_start = True
+        self._room = MAX_FILE_DIFF_BYTES
+        self._reviewable = True
+        self._cut = False
+        self._ends_nl = True
+
+    def feed(self, data):
+        buf = self._pending + data
+        pos = 0
+        while True:
+            i = buf.find(_SECTION_MARK, pos)
+            if i < 0:
+                # Hold back a tail that could be the start of a header.
+                end = max(pos, len(buf) - len(_SECTION_MARK) + 1)
+                self._keep(buf[pos:end])
+                self._pending = buf[end:]
+                return
+            j = buf.find(b"\n", i + 1)
+            if j < 0 and len(buf) - i <= _MAX_HEADER_BYTES:
+                # The header line is not complete yet.
+                self._keep(buf[pos:i])
+                self._pending = buf[i:]
+                return
+            self._keep(buf[pos:i + 1])
+            if j >= 0:
+                self._begin(buf[i + 1:j])
+            pos = i + 1
+
+    def _begin(self, header):
+        """A new file's section starts with this `diff --git ` line."""
+        text = header[len(_SECTION_MARK) - 1:].decode("utf-8", errors="replace")
+        paths = _parse_diff_header(text)
+        # Same test as parse_diff_into_files. An unparsed header is passed on
+        # so the parser still counts it.
+        self._reviewable = not paths or _is_reviewable_source(paths[1] or paths[0])
+        if not self._reviewable:
+            self._room = len(header) + 1
+        elif self.kept > MAX_KEPT_DIFF_BYTES:
+            self._room = max(len(header) + 1, _LATE_FILE_DIFF_BYTES)
+        else:
+            self._room = MAX_FILE_DIFF_BYTES
+        self._cut = False
+        if not self._ends_nl:
+            # The previous file was cut inside a line.
+            self.parts.append(b"\n")
+            self._ends_nl = True
+
+    def _keep(self, data):
+        if self._at_start and data:
+            self._at_start = False
+            data = data[1:]
+        if not data:
+            return
+        self.seen += len(data)
+        take = data[:self._room]
+        if take:
+            self.parts.append(take)
+            self.kept += len(take)
+            self._room -= len(take)
+            self._ends_nl = take.endswith(b"\n")
+        if len(take) < len(data) and self._reviewable:
+            self.cut_bytes += len(data) - len(take)
+            if not self._cut:
+                self._cut = True
+                self.cut_files += 1
+
+    def result(self):
+        self._keep(self._pending)
+        self._pending = b""
+        if not self._ends_nl:
+            # Cut inside a line: end it, so anything joined after this
+            # output starts on a line of its own.
+            self.parts.append(b"\n")
+            self._ends_nl = True
+        return b"".join(self.parts)
+
+
+def _run_diff_bounded(cmd, timeout, **kwargs):
+    """subprocess.run(cmd, capture_output=True, timeout=timeout) for a
+    `git diff`, except that stdout goes through _DiffKeeper instead of being
+    held whole."""
+    keeper = _DiffKeeper()
+    try:
+        err = tempfile.TemporaryFile()
+    except OSError:
+        err = None
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=err if err is not None else subprocess.DEVNULL,
+                             **kwargs)
+        expired = threading.Event()
+
+        def _expire():
+            expired.set()
+            p.kill()
+
+        timer = threading.Timer(timeout, _expire)
+        timer.daemon = True
+        try:
+            try:
+                timer.start()
+            except RuntimeError as e:
+                raise OSError(f"no thread for the diff timeout: {e}")
+            while True:
+                chunk = p.stdout.read1(1024 * 1024)
+                if not chunk:
+                    break
+                keeper.feed(chunk)
+            returncode = p.wait()
+        except BaseException:
+            p.kill()
+            p.wait()
+            raise
+        finally:
+            timer.cancel()
+            p.stdout.close()
+        stdout = keeper.result()
+        _diff_read["bytes"] += keeper.seen
+        _diff_read["cut_files"] += keeper.cut_files
+        _diff_read["cut_bytes"] += keeper.cut_bytes
+        # A diff that finished as the timer fired is still a finished diff.
+        if expired.is_set() and returncode != 0:
+            _diff_read["timeouts"] += 1
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        stderr = b""
+        if err is not None:
+            err.seek(0)
+            stderr = err.read(4096)
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+    finally:
+        if err is not None:
+            err.close()
+
+
 def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_paths=None):
     """
     Get the git diff between the baseline SHA and the current working tree,
@@ -781,6 +958,9 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
     cwd; absolute paths are converted, paths outside cwd are dropped).
     `untracked_paths` (repo-root-relative) is forwarded to _temp_index so it
     can add only those files instead of scanning the whole worktree.
+    The output is read through _DiffKeeper: files the review would drop come
+    back as their header line only, and a file's diff past
+    MAX_FILE_DIFF_BYTES is cut.
     """
     pathspec = _diff_pathspec(cwd, paths)
     if paths and not pathspec:
@@ -792,16 +972,17 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
 
     # core.quotePath=false comes from GIT_CMD globally (see definition).
     cmd = [*GIT_CMD, "diff", "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else []) + pathspec
+    _diff_read.update(bytes=0, cut_files=0, cut_bytes=0)
     try:
         if untracked_paths is not None and not untracked_paths:
             # Nothing to `add -N`, and the diff only reads the index.
-            result = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=30)
+            result = _run_diff_bounded(cmd, 30, cwd=cwd)
         else:
             with _temp_index(cwd, untracked_paths) as env:
                 # env is None when there is no index (bare repo / not a repo)
                 # or no copy slot — diff still runs, just without
                 # untracked-file support.
-                result = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=30, env=env)
+                result = _run_diff_bounded(cmd, 30, cwd=cwd, env=env)
         if result.returncode != 0:
             debug_log(f"git diff failed: {result.stderr[:200].decode('utf-8', errors='replace')}")
             return None

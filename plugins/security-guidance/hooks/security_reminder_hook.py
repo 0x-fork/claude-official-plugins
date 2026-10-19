@@ -2136,6 +2136,12 @@ def handle_push_sweep_posttooluse(input_data):
                  hook_event_name="PostToolUse")
     sys.exit(2)
 
+def _stop_diff_truncated():
+    """Bytes of reviewable diff the Stop review did not send: cut while
+    reading git's output, plus what the prompt caps dropped after that."""
+    return llm._last_review_truncated_bytes + gitutil._diff_read["cut_bytes"]
+
+
 def handle_stop_hook(input_data):
     """
     Handle the Stop hook — final security check using git diff.
@@ -2282,6 +2288,13 @@ def handle_stop_hook(input_data):
         debug_log(f"Stop hook: diff against {content_base[:12]} failed — falling back to {diff_base}")
         diff_output = get_git_diff(repo_root, diff_base, full_context=False,
                                    paths=review_paths, untracked_paths=untracked)
+    # Only when it happened: MiB of git diff output read, reviewable files
+    # whose diff was cut while reading it, diffs that hit the timeout.
+    for _k, _v in (("diff_mb", gitutil._diff_read["bytes"] >> 20),
+                   ("diff_cut_files", gitutil._diff_read["cut_files"]),
+                   ("diff_timeout", gitutil._diff_read["timeouts"])):
+        if _v:
+            _TAIL_METRICS[_k] = _v
     # filter_preexisting_from_diff needs a resolvable pre-turn ref; fall
     # back to HEAD when UPS never captured a baseline (print mode).
     if not baseline_sha:
@@ -2419,8 +2432,8 @@ def handle_stop_hook(input_data):
             "touched_paths_count": len(touched_paths),
             "review_ms": review_ms,
             "fire_index": fire_index,
-            **({"diff_truncated": llm._last_review_truncated_bytes}
-               if llm._last_review_truncated_bytes else {}),
+            **({"diff_truncated": _stop_diff_truncated()}
+               if _stop_diff_truncated() else {}),
             **({"repo_resolution": repo_res} if res_metrics else {}),
             **sweep_trimmed,
             **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
@@ -2457,8 +2470,8 @@ def handle_stop_hook(input_data):
         "review_ms": review_ms,
         "fire_index": fire_index,
         **({"api_error": llm._last_call_claude_http_error} if llm._last_call_claude_http_error is not None else {}),
-        **({"diff_truncated": llm._last_review_truncated_bytes}
-           if llm._last_review_truncated_bytes else {}),
+        **({"diff_truncated": _stop_diff_truncated()}
+           if _stop_diff_truncated() else {}),
         **v2_metrics,
         **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
            if gitutil._unparsed_diff_headers else {}),
