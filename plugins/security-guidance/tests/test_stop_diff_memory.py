@@ -4,6 +4,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 import tracemalloc
 
 import pytest
@@ -14,6 +15,22 @@ from conftest import (
 )
 
 import gitutil
+
+
+@pytest.fixture(autouse=True)
+def _fresh_read_state():
+    yield
+    gitutil._unparsed_diff_headers.clear()
+    gitutil._diff_read.update(bytes=0, cut_files=0, cut_bytes=0, timeouts=0)
+
+
+def _rewrite(path, removed, added):
+    return (f"diff --git a/{path} b/{path}\n"
+            "index 1111111..2222222 100644\n"
+            f"--- a/{path}\n+++ b/{path}\n"
+            f"@@ -1,{len(removed)} +1,{len(added)} @@\n"
+            + "".join(f"-{ln}\n" for ln in removed)
+            + "".join(f"+{ln}\n" for ln in added))
 
 
 @pytest.fixture
@@ -96,34 +113,77 @@ class TestDiffKeeper:
         files = dict(gitutil.parse_diff_into_files(kept.decode()))
         assert set(files) == {"big.json", "after.py"}
         assert files["after.py"] == dict(gitutil.parse_diff_into_files(raw.decode()))["after.py"]
-        assert files["big.json"] and len(files["big.json"]) < 300
+        # The start of the section, then as much again of its added lines.
+        assert 300 < len(files["big.json"]) <= 2 * 300 + len(gitutil._CUT_MARK) + 2
         assert keeper.cut_files == 1
-        assert keeper.kept <= 300 + len(_section("after.py", ["import os"])) + 1
+        assert keeper.cut_bytes == len(big) - 2 * 300
+
+    def test_cut_file_says_so_on_its_last_line(self, monkeypatch):
+        monkeypatch.setattr(gitutil, "MAX_FILE_DIFF_BYTES", 300)
+        raw = (_section("big.json", ["k" * 37] * 100) + _section("after.py", ["x"])).encode()
+        _, kept = _keep(raw, _sizes(64))
+        files = dict(gitutil.parse_diff_into_files(kept.decode()))
+        assert files["big.json"].endswith(gitutil._CUT_MARK.decode())
+        assert "cut by security-guidance" not in files["after.py"]
+        assert kept.count(gitutil._CUT_MARK) == 1
+
+    @pytest.mark.parametrize("chunk", [1, 23, 4096])
+    def test_rewrite_past_the_cap_keeps_its_added_lines(self, monkeypatch, chunk):
+        monkeypatch.setattr(gitutil, "MAX_FILE_DIFF_BYTES", 400)
+        raw = (_rewrite("views.py", ["old line %03d" % i for i in range(200)],
+                        ["os.system(cmd)"] + ["new line %03d" % i for i in range(200)])
+               + _section("after.py", ["x"])).encode()
+        keeper, kept = _keep(raw, _sizes(chunk))
+        body = dict(gitutil.parse_diff_into_files(kept.decode()))["views.py"]
+        assert "+os.system(cmd)\n" in body
+        assert "-old line 199" not in body
+        past = body[400:]
+        assert all(ln.startswith(("+", "\\")) for ln in past.splitlines()[1:])
+        assert len(body) <= 2 * 400 + len(gitutil._CUT_MARK) + 2
+        assert keeper.cut_files == 1
 
     def test_dropped_large_file_is_not_counted_as_cut(self, monkeypatch):
         monkeypatch.setattr(gitutil, "MAX_FILE_DIFF_BYTES", 300)
         raw = (_section("big.log", ["k" * 37] * 100) + _section("after.py", ["x"])).encode()
         keeper, kept = _keep(raw, _sizes(64))
-        assert keeper.cut_files == 0
+        assert keeper.cut_files == 0 and keeper.cut_bytes == 0
         assert [p for p, _ in gitutil.parse_diff_into_files(kept.decode())] == ["after.py"]
 
-    def test_past_the_total_each_file_keeps_only_its_start(self, monkeypatch):
+    def test_renamed_from_a_secret_shaped_name_keeps_its_header_only(self):
+        raw = (_section("config.py", ["TOKEN = 'abc'"], old=".env")
+               + _section("after.py", ["x"])).encode()
+        want = gitutil.parse_diff_into_files(raw.decode())
+        _, kept = _keep(raw, _sizes(64))
+        assert gitutil.parse_diff_into_files(kept.decode()) == want
+        assert [p for p, _ in want] == ["after.py"]
+        assert b"TOKEN" not in kept
+
+    def test_past_the_total_later_files_keep_less_and_less(self, monkeypatch):
         monkeypatch.setattr(gitutil, "MAX_FILE_DIFF_BYTES", 2000)
         monkeypatch.setattr(gitutil, "MAX_KEPT_DIFF_BYTES", 3000)
         monkeypatch.setattr(gitutil, "_LATE_FILE_DIFF_BYTES", 200)
-        raw = "".join(_section(f"f{i}.py", ["v" * 30] * 60) for i in range(6)).encode()
+        monkeypatch.setattr(gitutil, "_LAST_FILE_DIFF_BYTES", 120)
+        raw = "".join(_section(f"f{i}.py", ["v" * 30] * 400) for i in range(40)).encode()
         keeper, kept = _keep(raw, _sizes(333))
         files = gitutil.parse_diff_into_files(kept.decode())
-        assert [p for p, _ in files] == [f"f{i}.py" for i in range(6)]
-        assert len(kept) <= 2 * 2000 + 4 * 200 + 6
-        assert keeper.cut_files == 6
+        assert [p for p, _ in files] == [f"f{i}.py" for i in range(40)]
+        sizes = [len(body) for _, body in files]
+        mark = len(gitutil._CUT_MARK) + 2
+        assert sizes[0] > 2000 and sizes[0] <= 4000 + mark
+        assert 200 < sizes[5] <= 400 + mark
+        assert sizes[-1] <= 120 + mark
+        assert sizes[0] > sizes[5] > sizes[-1]
+        assert keeper.cut_files == 40
+        # Everything not kept is counted; a cut may add a newline or two.
+        from_git = len(kept) - 40 * len(gitutil._CUT_MARK)
+        assert from_git - 80 <= len(raw) - keeper.cut_bytes <= from_git
 
     def test_output_cut_inside_a_line_ends_with_a_newline(self, monkeypatch):
         monkeypatch.setattr(gitutil, "MAX_FILE_DIFF_BYTES", 300)
-        raw = _section("big.json", ["k" * 37] * 100).encode()
+        raw = _rewrite("big.json", ["k" * 37] * 100, []).encode()
         keeper, kept = _keep(raw, _sizes(64))
-        assert kept.endswith(b"\n") and not raw.startswith(kept)
-        assert keeper.cut_bytes == len(raw) - (len(kept) - 1)
+        assert kept == raw[:300] + b"\n" + gitutil._CUT_MARK
+        assert keeper.cut_bytes == len(raw) - 300
         both = kept + _section("next.py", ["x"]).encode()
         assert [p for p, _ in gitutil.parse_diff_into_files(both.decode())] == ["big.json", "next.py"]
 
@@ -134,7 +194,8 @@ class TestDiffKeeper:
 
 class TestRunDiffBounded:
     def test_returns_what_run_would(self):
-        code = "import sys; sys.stdout.write('diff --git a/a.py b/a.py\\n@@ -1 +1 @@\\n+x\\n'); sys.stderr.write('warn'); sys.exit(3)"
+        code = ("import sys; sys.stdout.buffer.write(b'diff --git a/a.py b/a.py\\n@@ -1 +1 @@\\n+x\\n'); "
+                "sys.stderr.write('warn'); sys.exit(3)")
         r = gitutil._run_diff_bounded([sys.executable, "-c", code], 30)
         assert r.returncode == 3
         assert r.stdout == b"diff --git a/a.py b/a.py\n@@ -1 +1 @@\n+x\n"
@@ -147,18 +208,41 @@ class TestRunDiffBounded:
             gitutil._run_diff_bounded([sys.executable, "-c", code], 0.5)
         assert gitutil._diff_read["timeouts"] == before + 1
 
-    def test_finished_as_the_timer_fired_is_not_a_timeout(self, monkeypatch):
-        class Fired:
-            def __init__(self, timeout, fn):
-                self.fn = fn
-            daemon = False
-            def start(self):
-                pass
-            def cancel(self):
-                self.fn()
-        monkeypatch.setattr(gitutil.threading, "Timer", Fired)
-        r = gitutil._run_diff_bounded([sys.executable, "-c", "print('ok')"], 30)
-        assert r.returncode == 0 and r.stdout.strip() == b"ok"
+    def test_timeout_holds_while_another_process_keeps_the_pipe_open(self):
+        # What a `git diff` that started a fetch looks like: the program is
+        # gone, something it started still holds its stdout.
+        code = ("import subprocess, sys; "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(8)']); "
+                "sys.stdout.write('x'); sys.stdout.flush()")
+        before = gitutil._diff_read["timeouts"]
+        t0 = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            gitutil._run_diff_bounded([sys.executable, "-c", code], 1)
+        assert time.monotonic() - t0 < 5
+        assert gitutil._diff_read["timeouts"] == before + 1
+
+    def test_a_timed_out_read_still_reports_its_size(self):
+        code = "import sys, time; sys.stdout.write('x' * 300000); sys.stdout.flush(); time.sleep(60)"
+        with pytest.raises(subprocess.TimeoutExpired):
+            gitutil._run_diff_bounded([sys.executable, "-c", code], 1)
+        assert gitutil._diff_read["bytes"] >= 200000
+
+    def test_a_read_that_breaks_is_an_error_not_a_short_diff(self, monkeypatch):
+        def broken(self, data):
+            raise MemoryError("no room")
+        monkeypatch.setattr(gitutil._DiffKeeper, "feed", broken)
+        code = "import sys; sys.stdout.write('diff --git a/a.py b/a.py\\n' * 50000)"
+        t0 = time.monotonic()
+        with pytest.raises(OSError):
+            gitutil._run_diff_bounded([sys.executable, "-c", code], 30)
+        assert time.monotonic() - t0 < 10
+
+    def test_no_thread_to_read_with_is_an_error(self, monkeypatch):
+        def refuse(self):
+            raise RuntimeError("can't start new thread")
+        monkeypatch.setattr(gitutil.threading.Thread, "start", refuse)
+        with pytest.raises(OSError):
+            gitutil._run_diff_bounded([sys.executable, "-c", "print('x')"], 30)
 
     def test_missing_program_raises_like_run(self):
         with pytest.raises(FileNotFoundError):
@@ -196,8 +280,8 @@ class TestGetGitDiff:
                                     untracked_paths=[]) is None
 
     @pytest.mark.parametrize("value, want", [
-        ("", 4 * 1024 * 1024), ("junk", 4 * 1024 * 1024), ("0", 64 * 1024),
-        ("-5", 64 * 1024), ("100000", 100000)])
+        ("", 4 * 1024 * 1024), ("junk", 4 * 1024 * 1024), ("0", 4 * 1024 * 1024),
+        ("-5", 4 * 1024 * 1024), ("1000", 256 * 1024), ("1000000", 1000000)])
     def test_cap_setting_cannot_break_the_read(self, monkeypatch, value, want):
         monkeypatch.setenv("SG_MAX_FILE_DIFF_BYTES", value)
         assert gitutil._file_diff_cap() == want
@@ -217,6 +301,19 @@ class TestGetGitDiff:
             gitutil.parse_diff_into_files(diff), str(repo), "HEAD")
         assert "+os.system(request.GET['cmd'])" in files[0][1][:2000]
 
+    def test_rewrite_past_the_cap_still_shows_what_is_new(self, tmp_path, git_env, monkeypatch):
+        monkeypatch.setattr(gitutil, "MAX_FILE_DIFF_BYTES", 200000)
+        body = "".join(f"def handler_{i}(request):\n    return render(request, 'page_{i}.html')\n"
+                       for i in range(18000))
+        repo = make_repo(tmp_path / "repo", {"views.py": body.replace("\n", "\r\n")})
+        (repo / "views.py").write_bytes(("import os\nos.system(request.GET['cmd'])\n" + body).encode())
+        diff = gitutil.get_git_diff(str(repo), "HEAD", paths=[str(repo / "views.py")], untracked_paths=[])
+        assert gitutil._diff_read["cut_files"] == 1
+        assert len(diff) < 2 * 200000 + 1000
+        files = gitutil.filter_preexisting_from_diff(
+            gitutil.parse_diff_into_files(diff), str(repo), "HEAD")
+        assert "+os.system(request.GET['cmd'])" in files[0][1][:2000]
+
     def test_failed_diff_is_still_none(self, tmp_path, git_env):
         repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
         assert gitutil.get_git_diff(str(repo), "0" * 40, paths=[str(repo / "app.py")],
@@ -229,15 +326,17 @@ class TestStopHook:
         run_hook(ups_payload(repo), hook_env)
         (repo / "app.py").write_text(VULN_PY)
         (repo / "gen.txt").write_text("some generated text\n" * 150000)
-        (repo / "big.json").write_text('"k": "some generated value",\n' * 9000)
-        env = {**hook_env, "SG_MAX_FILE_DIFF_BYTES": "100000"}
+        (repo / "big.json").write_text('"k": "some generated value",\n' * 20000)
+        env = {**hook_env, "SG_MAX_FILE_DIFF_BYTES": "1000"}
         rc, so, se = run_hook(stop_payload(repo), env)
         m = metrics_of(so)
         assert not m.get("skipped"), m
         assert m["files_reviewed"] == 2
         assert m["diff_mb"] == 3
         assert m["diff_cut_files"] == 1
-        assert m["diff_truncated"] > 9000 * 29 - 80000 - 1000
+        # 256 KiB from the start and as much again of added lines were read;
+        # the prompt took 80,000 bytes of that.
+        assert m["diff_truncated"] > 20000 * 29 - 80000 - 1000
         assert "diff_timeout" not in m
         assert stub_api.calls
 

@@ -2138,8 +2138,10 @@ def handle_push_sweep_posttooluse(input_data):
 
 def _stop_diff_truncated():
     """Bytes of reviewable diff the Stop review did not send: cut while
-    reading git's output, plus what the prompt caps dropped after that."""
-    return llm._last_review_truncated_bytes + gitutil._diff_read["cut_bytes"]
+    reading git's output, plus what the prompt caps dropped after that.
+    As the metric to emit, or nothing when there were none."""
+    n = llm._last_review_truncated_bytes + gitutil._diff_read["cut_bytes"]
+    return {"diff_truncated": n} if n else {}
 
 
 def handle_stop_hook(input_data):
@@ -2432,8 +2434,7 @@ def handle_stop_hook(input_data):
             "touched_paths_count": len(touched_paths),
             "review_ms": review_ms,
             "fire_index": fire_index,
-            **({"diff_truncated": _stop_diff_truncated()}
-               if _stop_diff_truncated() else {}),
+            **_stop_diff_truncated(),
             **({"repo_resolution": repo_res} if res_metrics else {}),
             **sweep_trimmed,
             **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
@@ -2470,8 +2471,7 @@ def handle_stop_hook(input_data):
         "review_ms": review_ms,
         "fire_index": fire_index,
         **({"api_error": llm._last_call_claude_http_error} if llm._last_call_claude_http_error is not None else {}),
-        **({"diff_truncated": _stop_diff_truncated()}
-           if _stop_diff_truncated() else {}),
+        **_stop_diff_truncated(),
         **v2_metrics,
         **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
            if gitutil._unparsed_diff_headers else {}),

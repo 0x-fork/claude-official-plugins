@@ -20,6 +20,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 
 from _base import debug_log
 
@@ -768,26 +769,37 @@ def _is_ancestor(cwd, maybe_ancestor, descendant):
         return False
 
 
+_DEFAULT_FILE_DIFF_BYTES = 4 * 1024 * 1024
+_LATE_FILE_DIFF_BYTES = 256 * 1024
+_LAST_FILE_DIFF_BYTES = 96 * 1024
+
 
 def _file_diff_cap():
+    """SG_MAX_FILE_DIFF_BYTES, or the default when it is unset, not a number
+    or not positive. Never below what a late file keeps, which is well above
+    what the review prompt takes of one file."""
     try:
         n = int(os.environ.get("SG_MAX_FILE_DIFF_BYTES", ""))
     except ValueError:
-        return 4 * 1024 * 1024
+        return _DEFAULT_FILE_DIFF_BYTES
+    if n <= 0:
+        return _DEFAULT_FILE_DIFF_BYTES
     return max(n, _LATE_FILE_DIFF_BYTES)
 
 
-_LATE_FILE_DIFF_BYTES = 64 * 1024
 # How much of one file's diff the Stop review keeps while it reads git's
-# output. The review prompt takes far less of a file (DIFF_PER_FILE_BYTES);
-# the rest is room for filter_preexisting_from_diff, which needs the removed
-# and the added side of a rewritten file, so a rewrite keeps both sides for
-# files up to about half of this.
+# output: this much from the start of the file's section, and as much again
+# of the added lines after that. The review prompt takes far less of a file
+# (DIFF_PER_FILE_BYTES); the rest is for filter_preexisting_from_diff, which
+# needs the removed and the added side of a rewritten file.
 MAX_FILE_DIFF_BYTES = _file_diff_cap()
-# Past this much kept in total, each further file keeps only its start.
+# Past this much kept in total, a further file keeps _LATE_FILE_DIFF_BYTES
+# the same two ways; past four times as much, _LAST_FILE_DIFF_BYTES from its
+# start, which is still more than the review prompt takes of one file.
 MAX_KEPT_DIFF_BYTES = 4 * MAX_FILE_DIFF_BYTES
 _SECTION_MARK = b"\ndiff --git "
 _MAX_HEADER_BYTES = 64 * 1024
+_CUT_MARK = b"\\ [cut by security-guidance: the rest of this file's diff was not read]\n"
 
 # What the last get_git_diff read, for the Stop hook's metrics: bytes of git
 # output, reviewable files whose diff was cut and the bytes cut from them,
@@ -797,9 +809,9 @@ _diff_read = {"bytes": 0, "cut_files": 0, "cut_bytes": 0, "timeouts": 0}
 
 class _DiffKeeper:
     """Takes `git diff` output as it arrives and keeps only what the review
-    can use: the header line of every file, and up to MAX_FILE_DIFF_BYTES of
-    each file parse_diff_into_files would keep. A turn that wrote large data
-    files no longer puts their whole diff in memory."""
+    can use: the header line of every file, and a bounded part of each file
+    parse_diff_into_files would keep. A turn that wrote large data files no
+    longer puts their whole diff in memory."""
 
     def __init__(self):
         self.parts = []
@@ -811,10 +823,14 @@ class _DiffKeeper:
         # at the very start of the output is found like any other.
         self._pending = b"\n"
         self._at_start = True
-        self._room = MAX_FILE_DIFF_BYTES
         self._reviewable = True
+        self._room = self._added_room = MAX_FILE_DIFF_BYTES
         self._cut = False
         self._ends_nl = True
+        # Past the cut: whether the next byte starts a line, and whether the
+        # line being read is an added one.
+        self._bol = True
+        self._in_added = False
 
     def feed(self, data):
         buf = self._pending + data
@@ -824,66 +840,116 @@ class _DiffKeeper:
             if i < 0:
                 # Hold back a tail that could be the start of a header.
                 end = max(pos, len(buf) - len(_SECTION_MARK) + 1)
-                self._keep(buf[pos:end])
+                self._keep(buf, pos, end)
                 self._pending = buf[end:]
                 return
             j = buf.find(b"\n", i + 1)
             if j < 0 and len(buf) - i <= _MAX_HEADER_BYTES:
                 # The header line is not complete yet.
-                self._keep(buf[pos:i])
+                self._keep(buf, pos, i)
                 self._pending = buf[i:]
                 return
-            self._keep(buf[pos:i + 1])
+            self._keep(buf, pos, i + 1)
             if j >= 0:
                 self._begin(buf[i + 1:j])
             pos = i + 1
 
     def _begin(self, header):
         """A new file's section starts with this `diff --git ` line."""
+        self._end_section()
         text = header[len(_SECTION_MARK) - 1:].decode("utf-8", errors="replace")
         paths = _parse_diff_header(text)
-        # Same test as parse_diff_into_files. An unparsed header is passed on
-        # so the parser still counts it.
-        self._reviewable = not paths or _is_reviewable_source(paths[1] or paths[0])
+        # A section the parser drops, or whose header it cannot read and only
+        # counts, keeps its header line.
+        self._reviewable = bool(paths) and _section_is_reviewable(
+            paths[1] or paths[0], paths[0])
         if not self._reviewable:
-            self._room = len(header) + 1
+            self._room, self._added_room = len(header) + 1, 0
+        elif self.kept > 4 * MAX_KEPT_DIFF_BYTES:
+            self._room, self._added_room = max(len(header) + 1, _LAST_FILE_DIFF_BYTES), 0
         elif self.kept > MAX_KEPT_DIFF_BYTES:
-            self._room = max(len(header) + 1, _LATE_FILE_DIFF_BYTES)
+            self._room = self._added_room = max(len(header) + 1, _LATE_FILE_DIFF_BYTES)
         else:
-            self._room = MAX_FILE_DIFF_BYTES
+            self._room = self._added_room = MAX_FILE_DIFF_BYTES
         self._cut = False
-        if not self._ends_nl:
-            # The previous file was cut inside a line.
-            self.parts.append(b"\n")
-            self._ends_nl = True
 
-    def _keep(self, data):
-        if self._at_start and data:
+    def _end_section(self):
+        if not self._ends_nl:
+            # Cut inside a line: end it, so what follows starts a line.
+            self._append(b"\n")
+        if self._cut:
+            self._append(_CUT_MARK)
+
+    def _append(self, piece):
+        self.parts.append(piece)
+        self.kept += len(piece)
+        self._ends_nl = piece.endswith(b"\n")
+
+    def _keep(self, buf, start, end):
+        if self._at_start and end > start:
             self._at_start = False
-            data = data[1:]
-        if not data:
+            start += 1
+        n = end - start
+        if n <= 0:
             return
-        self.seen += len(data)
-        take = data[:self._room]
+        self.seen += n
+        take = min(n, self._room)
         if take:
-            self.parts.append(take)
-            self.kept += len(take)
-            self._room -= len(take)
-            self._ends_nl = take.endswith(b"\n")
-        if len(take) < len(data) and self._reviewable:
-            self.cut_bytes += len(data) - len(take)
-            if not self._cut:
-                self._cut = True
-                self.cut_files += 1
+            self._append(buf[start:start + take])
+            self._room -= take
+        if take == n or not self._reviewable:
+            return
+        if not self._cut:
+            self._cut = True
+            self.cut_files += 1
+            self._bol = self._ends_nl
+            self._in_added = False
+        self.cut_bytes += n - take - self._keep_added(buf, start + take, end)
+
+    def _keep_added(self, buf, pos, end):
+        """Past a file's cut, keep its added lines only, up to as much again.
+        A rewritten file lists every removed line before the first added one,
+        and the review is about the added ones. Returns the bytes kept."""
+        kept = 0
+        run = -1  # where a run of added lines not yet appended starts
+        while pos < end and self._added_room > 0:
+            if self._bol:
+                self._bol = False
+                self._in_added = buf.startswith(b"+", pos)
+                if self._in_added and run < 0 and not self._ends_nl:
+                    self._append(b"\n")
+            if not self._in_added:
+                if run >= 0:
+                    self._append(buf[run:pos])
+                    run = -1
+                nxt = buf.find(b"\n+", pos, end)
+                if nxt < 0:
+                    self._bol = buf.endswith(b"\n", pos, end)
+                    break
+                pos = nxt + 1
+                self._bol = True
+                continue
+            nl = buf.find(b"\n", pos, end)
+            stop = end if nl < 0 else nl + 1
+            take = min(stop - pos, self._added_room)
+            if run < 0:
+                run = pos
+            self._added_room -= take
+            kept += take
+            self._bol = nl >= 0
+            if pos + take < stop:
+                self._append(buf[run:pos + take])
+                run = -1
+            pos = stop
+        if run >= 0:
+            self._append(buf[run:pos])
+        return kept
 
     def result(self):
-        self._keep(self._pending)
+        self._keep(self._pending, 0, len(self._pending))
         self._pending = b""
-        if not self._ends_nl:
-            # Cut inside a line: end it, so anything joined after this
-            # output starts on a line of its own.
-            self.parts.append(b"\n")
-            self._ends_nl = True
+        self._end_section()
+        self._cut = False
         return b"".join(self.parts)
 
 
@@ -892,6 +958,7 @@ def _run_diff_bounded(cmd, timeout, **kwargs):
     `git diff`, except that stdout goes through _DiffKeeper instead of being
     held whole."""
     keeper = _DiffKeeper()
+    deadline = time.monotonic() + timeout
     try:
         err = tempfile.TemporaryFile()
     except OSError:
@@ -900,40 +967,57 @@ def _run_diff_bounded(cmd, timeout, **kwargs):
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                              stderr=err if err is not None else subprocess.DEVNULL,
                              **kwargs)
-        expired = threading.Event()
+        failed = []
+        given_up = []
 
-        def _expire():
-            expired.set()
-            p.kill()
+        def _read():
+            try:
+                while not given_up:
+                    chunk = p.stdout.read1(65536)
+                    if not chunk or given_up:
+                        break
+                    keeper.feed(chunk)
+            except BaseException as e:
+                failed.append(e)
 
-        timer = threading.Timer(timeout, _expire)
-        timer.daemon = True
+        # Read on a thread, so the timeout holds even while something git
+        # started still has the pipe open after git itself is gone.
+        reader = threading.Thread(target=_read, daemon=True)
+        timed_out = False
         try:
             try:
-                timer.start()
+                reader.start()
             except RuntimeError as e:
-                raise OSError(f"no thread for the diff timeout: {e}")
-            while True:
-                chunk = p.stdout.read1(1024 * 1024)
-                if not chunk:
-                    break
-                keeper.feed(chunk)
-            returncode = p.wait()
-        except BaseException:
-            p.kill()
-            p.wait()
-            raise
+                failed.append(e)
+            else:
+                reader.join(timeout)
+                timed_out = reader.is_alive()
+            if timed_out or failed:
+                p.kill()
+            try:
+                returncode = p.wait(max(deadline - time.monotonic(), 0.1))
+            except subprocess.TimeoutExpired:
+                timed_out = True
         finally:
-            timer.cancel()
-            p.stdout.close()
-        stdout = keeper.result()
+            if timed_out or failed or p.returncode is None:
+                # The reader may be left waiting on a pipe something else
+                # holds: it keeps nothing more, and the pipe stays its.
+                given_up.append(True)
+                p.kill()
+                p.wait()
+                if reader.ident is not None:
+                    reader.join(1)
+            if not reader.is_alive():
+                p.stdout.close()
         _diff_read["bytes"] += keeper.seen
-        _diff_read["cut_files"] += keeper.cut_files
-        _diff_read["cut_bytes"] += keeper.cut_bytes
-        # A diff that finished as the timer fired is still a finished diff.
-        if expired.is_set() and returncode != 0:
+        if timed_out:
             _diff_read["timeouts"] += 1
             raise subprocess.TimeoutExpired(cmd, timeout)
+        if failed:
+            raise OSError(f"reading the diff failed: {failed[0]!r}")
+        stdout = keeper.result()
+        _diff_read["cut_files"] += keeper.cut_files
+        _diff_read["cut_bytes"] += keeper.cut_bytes
         stderr = b""
         if err is not None:
             err.seek(0)
@@ -960,7 +1044,7 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
     can add only those files instead of scanning the whole worktree.
     The output is read through _DiffKeeper: files the review would drop come
     back as their header line only, and a file's diff past
-    MAX_FILE_DIFF_BYTES is cut.
+    MAX_FILE_DIFF_BYTES is cut down to its added lines.
     """
     pathspec = _diff_pathspec(cwd, paths)
     if paths and not pathspec:
@@ -1297,6 +1381,13 @@ def _parse_diff_header(header):
 _unparsed_diff_headers = set()
 
 
+def _section_is_reviewable(file_path, old_path):
+    """Whether a diff section is sent for review: a source file, and not one
+    renamed away from a secret-shaped name, which still carries the secret's
+    content."""
+    return _is_reviewable_source(file_path) and not _skip_secret_shaped(old_path)
+
+
 def _iter_diff_sections(diff_output):
     """Yield (new_path, old_path, lines after the header line) per file section."""
     for section in _DIFF_SECTION_RE.split(diff_output)[1:]:
@@ -1318,7 +1409,7 @@ def extract_file_paths_from_diff(diff_output):
 
     return [
         file_path for file_path, old_path, _ in _iter_diff_sections(diff_output)
-        if _is_reviewable_source(file_path) and not _skip_secret_shaped(old_path)
+        if _section_is_reviewable(file_path, old_path)
     ]
 
 
@@ -1334,7 +1425,7 @@ def parse_diff_into_files(diff_output):
     for file_path, old_path, lines in _iter_diff_sections(diff_output):
         # Filter to source code files only. A rename away from a secret-shaped
         # name still carries the secret's content, so the old name counts too.
-        if not _is_reviewable_source(file_path) or _skip_secret_shaped(old_path):
+        if not _section_is_reviewable(file_path, old_path):
             continue
 
         # Extract the diff content (from first @@ onwards)
