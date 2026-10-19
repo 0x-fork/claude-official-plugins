@@ -321,12 +321,13 @@ def emit_metrics(
     _write_hook_output(out)
 
 
-def _llm_review_off():
+def _llm_review_off(session_id):
     """Why no LLM review can run: (log text, extra metrics), or None."""
     if not ENABLE_CODE_SECURITY_REVIEW:
         return "LLM review disabled", {}
-    if not HAS_API_CREDENTIALS:
-        return "no API credentials", {"no_creds": True}
+    if not llm.can_review(session_id):
+        return ("no API credentials and no Claude apps gateway sign-in",
+                {"no_creds": True})
     return None
 
 
@@ -344,16 +345,18 @@ def _credential_withholding_env_vars():
     return names
 
 
-def _no_credentials_notice(file_path):
+def _no_credentials_notice(file_path, session_id):
     """Text telling the user the LLM reviews are not running, or None.
 
-    Without credentials every Stop, commit and push review is skipped, and
-    nothing else tells the user. Returned for an edit inside a git repo (the
-    reviews only look at those), at most once a week per install: the marker
-    file in the state dir holds the time of the last notice. A marker that
-    can't be written means no notice rather than one on every edit. The
-    caller is the Edit/Write hook because the review hooks run in the
-    background, where Claude Code does not show a systemMessage.
+    With no credential and no Claude apps gateway sign-in, every Stop,
+    commit and push review is skipped, and nothing else tells the user.
+    Returned for an edit inside a git repo (the reviews only look at those),
+    at most once a week per install: the marker file in the state dir holds
+    the time of the last notice, or of the last check that found the reviews
+    running through a Claude apps gateway sign-in. A marker that can't be
+    written means no notice rather than one on every edit. The caller is the
+    Edit/Write hook because the review hooks run in the background, where
+    Claude Code does not show a systemMessage.
     """
     import time as _time
     try:
@@ -369,6 +372,12 @@ def _no_credentials_notice(file_path):
         os.makedirs(os.path.dirname(marker), exist_ok=True)
         with open(marker, "w"):
             pass
+        # In a session signed in to a Claude apps gateway the reviews do run,
+        # through the user's claude (llm.gateway_review_cli). `claude auth
+        # status` runs only after the marker is written, so an edit waits for
+        # it at most once a week.
+        if llm.can_review(session_id):
+            return None
     except OSError:
         return None
     withheld_by = _credential_withholding_env_vars()
@@ -1210,6 +1219,12 @@ def _review_failure_reason(status):
     if llm._is_3p_provider():
         return ("provider", "the review through the cloud provider got no answer",
                 "The plugin's log has the provider's error.")
+    if llm._gateway_cli:
+        pinned = os.environ.get("SECURITY_REVIEW_MODEL", "").strip()
+        return ("gateway", "the review through Claude Code on the Claude apps gateway returned no result",
+                "The plugin's log has the reason. If it says the sign-in has expired, run /login again."
+                + (f" SECURITY_REVIEW_MODEL ({pinned}) may also name a model the gateway does "
+                   "not serve." if pinned else ""))
     if status == 401:
         return ("auth", "the API rejected the plugin's credentials (HTTP 401)",
                 f"The sign-in may have expired or been revoked{gateway}.")
@@ -1402,7 +1417,7 @@ def handle_commit_review_posttooluse(input_data):
         emit_metrics({"skipped": True, "skip_reason": 32, **_base})
         sys.exit(0)
 
-    off = _llm_review_off()
+    off = _llm_review_off(session_id)
     if off:
         debug_log(f"Commit review: {off[0]}")
         emit_metrics({"skipped": True, "skip_reason": 22, **off[1], **_base})
@@ -1871,7 +1886,7 @@ def handle_push_sweep_posttooluse(input_data):
     if interrupted:
         emit_metrics({"skipped": True, "skip_reason": 21, **_base})
         sys.exit(0)
-    off = _llm_review_off()
+    off = _llm_review_off(session_id)
     if off:
         emit_metrics({"skipped": True, "skip_reason": 22, **off[1], **_base})
         sys.exit(0)
@@ -2294,7 +2309,7 @@ def handle_stop_hook(input_data):
         debug_log(f"Stop hook: already fired {fire_count} times (max {MAX_STOP_HOOK_FIRINGS}), skipping")
         _skip(2)
 
-    off = _llm_review_off()
+    off = _llm_review_off(session_id)
     if off:
         debug_log(f"Stop hook: {off[0]}")
         _skip(3, **off[1])
@@ -2756,7 +2771,7 @@ def main():
         if (ENABLE_CODE_SECURITY_REVIEW and not HAS_API_CREDENTIALS
                 and (ENABLE_STOP_REVIEW or COMMIT_REVIEW_ENABLED
                      or PUSH_SWEEP_ENABLED)):
-            notice = _no_credentials_notice(file_path)
+            notice = _no_credentials_notice(file_path, session_id)
             if notice:
                 output["systemMessage"] = notice
         if output:

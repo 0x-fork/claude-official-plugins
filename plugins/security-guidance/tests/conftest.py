@@ -137,6 +137,9 @@ def hook_env(tmp_path, stub_api):
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{stub_api.server_port}",
         "NO_PROXY": "*", "no_proxy": "*",
         "SG_AGENTIC_COMMIT_REVIEW": "0",
+        # Points the plugin at a claude that does not exist, so no hook test
+        # runs this machine's own claude.
+        "SG_AGENTIC_CLI_PATH": str(tmp_path / "no-claude"),
         "SECURITY_GUIDANCE_COMMIT_REVIEW": "on",
         "SG_PUSH_SWEEP": "on",
         "PYTHONDONTWRITEBYTECODE": "1",

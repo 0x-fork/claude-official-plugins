@@ -9,6 +9,7 @@ from conftest import (
     bash_payload, commit_file, edit_payload, git, metrics_of, run_hook,
     stop_payload, ups_payload, VULN_PY,
 )
+from test_gateway_sign_in import NOT_SIGNED_IN, SIGNED_IN, calls_of, make_cli
 
 # Anything in the developer's shell that changes whether a review would run.
 _AMBIENT = (
@@ -173,3 +174,40 @@ def test_skipped_reviews_report_the_missing_credentials(workspace, hook_env, stu
                     bash_payload(repo, "git push origin main", session_id="s3")):
         rc, out, _ = run_hook(payload, off)
         assert "no_creds" not in metrics_of(out)
+
+
+def test_no_notice_in_a_signed_in_gateway_session(workspace, hook_env, tmp_path):
+    # Claude Code passes no credential there, but the reviews run through
+    # the user's claude, so they are running.
+    _, repo = workspace
+    cli, calls = make_cli(tmp_path, SIGNED_IN)
+    env = _env(hook_env, SG_AGENTIC_CLI_PATH=str(cli))
+    assert _notice(repo, env) is None
+    # The check counts as this week's: a new session's edit does not ask.
+    assert _notice(repo, env, session_id="s2") is None
+    assert os.path.exists(_marker(env))
+    assert [c.split(" | ")[0] for c in calls_of(calls)] == ["auth status --json"]
+    # A week later the edit asks again.
+    eight_days = time.time() - 8 * 86400
+    os.utime(_marker(env), (eight_days, eight_days))
+    assert _notice(repo, env, session_id="s3") is None
+    assert len(calls_of(calls)) == 2
+
+
+def test_edit_outside_a_git_repo_does_not_ask_claude(workspace, hook_env, tmp_path):
+    cli, calls = make_cli(tmp_path, SIGNED_IN)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    env = _env(hook_env, SG_AGENTIC_CLI_PATH=str(cli))
+    assert _notice(plain, env, name="notes.py") is None
+    assert calls_of(calls) == []
+
+
+def test_notice_when_the_gateway_session_is_not_signed_in(workspace, hook_env, tmp_path):
+    _, repo = workspace
+    cli, calls = make_cli(tmp_path, NOT_SIGNED_IN)
+    env = _env(hook_env, SG_AGENTIC_CLI_PATH=str(cli))
+    assert "is not running" in _notice(repo, env)
+    # Within the week no notice is due, so claude is not asked again.
+    assert _notice(repo, env, session_id="s2") is None
+    assert len(calls_of(calls)) == 1
