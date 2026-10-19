@@ -2,6 +2,7 @@
 Claude Code gives hooks no credential."""
 import asyncio
 import json
+import os
 import sys
 import types
 
@@ -9,7 +10,7 @@ import pytest
 
 from conftest import (
     VULN_PY, bash_payload, commit_file, edit_payload, git, metrics_of, run_hook,
-    stop_payload, ups_payload,
+    stop_payload, ups_payload, write_cli,
 )
 
 import _base
@@ -26,10 +27,8 @@ def make_cli(tmp_path, auth_status, *, name="claude", hang=False, linger=False):
     waits 5 s before answering; `linger` leaves a process running that holds
     stdout open after the CLI exits."""
     calls = tmp_path / f"{name}.calls"
-    cli = tmp_path / name
-    cli.write_text(f"""#!{sys.executable}
-import os, subprocess, sys, time
-with open({str(calls)!r}, "a") as f:
+    script = f"""import os, subprocess, sys, time
+with open({str(calls)!r}, "a", encoding="utf-8") as f:
     f.write(" ".join(sys.argv[1:]) + " | SGD=" + os.environ.get("SECURITY_GUIDANCE_DISABLE", "")
             + " | CWD=" + os.getcwd() + "\\n")
 if sys.argv[1:3] != ["auth", "status"]:
@@ -41,13 +40,12 @@ sys.stdout.write({auth_status!r})
 sys.stdout.flush()
 if {linger!r}:
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
-""")
-    cli.chmod(0o755)
-    return cli, calls
+"""
+    return write_cli(tmp_path, name, script), calls
 
 
 def calls_of(calls):
-    return calls.read_text().splitlines() if calls.exists() else []
+    return calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
 
 
 def review_calls(calls):
@@ -108,7 +106,7 @@ class TestGatewaySignInCheck:
         cli, calls = make_cli(tmp_path, SIGNED_IN)
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setenv("SG_AGENTIC_CLI_PATH", "./claude")
+        monkeypatch.setenv("SG_AGENTIC_CLI_PATH", f"./{cli.name}")
         assert llm.can_review("s1") is False
         assert calls_of(calls) == []
 
@@ -118,6 +116,7 @@ class TestGatewaySignInCheck:
         home.mkdir()
         repo.mkdir()
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))  # "~" on Windows
         monkeypatch.chdir(repo)
         monkeypatch.setenv("SG_AGENTIC_CLI_PATH", str(cli))
         assert llm.can_review("s1")
@@ -379,6 +378,7 @@ class TestHooksInASignedInSession:
 
     def test_unanswered_sign_in_check_keeps_the_turn_for_the_next_stop(
             self, hook_env, tmp_path, workspace):
+        pytest.importorskip("claude_agent_sdk")
         env = without_credential(hook_env)
         cli, calls = make_cli(tmp_path, "")
         env["SG_AGENTIC_CLI_PATH"] = str(cli)

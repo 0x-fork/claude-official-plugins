@@ -1,10 +1,14 @@
 import http.server
+import io
 import json
 import os
+import struct
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -280,14 +284,47 @@ def env(hook_env, gateway):
     return e
 
 
+def _windows_exe(script):
+    """`script` as the bytes of a Windows .exe: Windows starts neither a
+    `#!` file nor, without a shell, a .cmd with multi-line arguments. Built
+    the way pip builds a console script: its launcher stub, then the
+    interpreter to run, then a zip holding the script as __main__.py."""
+    distlib = pytest.importorskip("pip._vendor.distlib")
+    stub = "t%s%s.exe" % ("64" if struct.calcsize("P") == 8 else "32",
+                          "-arm" if sysconfig.get_platform() == "win-arm64" else "")
+    stub = os.path.join(os.path.dirname(distlib.__file__), stub)
+    if not os.path.isfile(stub):
+        pytest.skip(f"pip has no script launcher {os.path.basename(stub)}")
+    with open(stub, "rb") as f:
+        launcher = f.read()
+    python = f'"{sys.executable}"' if " " in sys.executable else sys.executable
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("__main__.py", script)
+    return launcher + f"#!{python}\n".encode("utf-8") + archive.getvalue()
+
+
+def write_cli(tmp_path, name, script):
+    """A stand-in for `claude` in `tmp_path` that runs the Python `script`;
+    returns its path."""
+    if os.name == "nt":
+        cli = tmp_path / f"{name}.exe"
+        cli.write_bytes(_windows_exe(script))
+    else:
+        cli = tmp_path / name
+        cli.write_text(f"#!{sys.executable}\n{script}")
+        cli.chmod(0o755)
+    return cli
+
+
 @pytest.fixture
 def failing_inner_cli(tmp_path):
     """An inner CLI that prints a warning on stderr and exits 1; the review
     then falls back to a single-shot call."""
-    cli = tmp_path / "claude"
-    cli.write_text("#!/bin/sh\necho 'claude.ai connectors are disabled' >&2\nexit 1\n")
-    cli.chmod(0o755)
-    return str(cli)
+    return str(write_cli(tmp_path, "claude", (
+        "import sys\n"
+        "sys.stderr.write('claude.ai connectors are disabled\\n')\n"
+        "sys.exit(1)\n")))
 
 
 @pytest.fixture
