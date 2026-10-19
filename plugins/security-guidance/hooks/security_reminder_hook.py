@@ -102,6 +102,7 @@ from gitutil import (  # noqa: E402,F401
     GIT_CMD, apply_safe_git_env, remove_copies_on_termination,
     _git_rev_parse_head, _find_git_index, _diff_pathspec, _temp_index,
     _git_toplevel, _git_dir, _git_rev_list_range, _git_diff_range,
+    _git_toplevel_and_head, _git_head_at,
     _detect_main_branch, _git_reflog_recent_commits, _git_name_only,
     _git_status_porcelain, _is_ancestor, get_git_diff,
     SOURCE_CODE_EXTENSIONS, SOURCE_CODE_BASENAMES,
@@ -121,6 +122,8 @@ from diffstate import (  # noqa: E402,F401
     _reviewed_shas_path, _load_reviewed_shas, _append_reviewed_shas,
     _full_shas, _mark_inflight, _load_inflight_shas, _reviewed_after_inflight,
     UNTRACKED_BASELINE_CAP, _list_untracked, compute_v2_review_set,
+    baseline_origin, baseline_origin_metric, FOREIGN_ORIGINS,
+    KEPT_NO_CAPTURE, KEPT_UNREVIEWED,
 )
 from reporesolve import (  # noqa: E402,F401
     RES_NONE, RES_CWD, RES_COMMAND, RES_SHA_SCAN, RES_TOUCHED_PATHS, RES_HINT,
@@ -575,14 +578,24 @@ def handle_user_prompt_submit(input_data):
             # something tracked is dirtied.
             return _f_sha.result(), _f_ut.result() or {}
 
+    import time as _time
+    captured_at = _time.time()
     sha, untracked_now = _capture(cwd)
+    # No repo here and none remembered: the listing above failed, it did not
+    # come back empty.
+    no_repo = False
     if not sha and not _git_toplevel(cwd):
         hint = load_repo_hint(session_id)
         if hint:
             debug_log(f"UPS: cwd is not a git repo; using repo hint {hint!r}")
             cwd = hint
             sha, untracked_now = _capture(cwd)
-    head = _git_rev_parse_head(cwd)
+        else:
+            no_repo = True
+    # The repo root rides on the same git call as HEAD.
+    root, head = (None, None) if no_repo else _git_toplevel_and_head(cwd)
+    if sha and not head:
+        head = _git_rev_parse_head(cwd)
 
     # If the previous turn's Stop hook never ran (user interrupt, follow-up
     # during work, tool-reject, model crash, maxTurns, PostToolUse block…),
@@ -605,10 +618,25 @@ def handle_user_prompt_submit(input_data):
             # untracked file in the tree as written this turn.
             if untracked_now is not None and "untracked_at_baseline" not in state:
                 state["untracked_at_baseline"] = untracked_now
+            # Once a prompt failed to capture, the baseline is old whatever
+            # later prompts did.
+            state["baseline_kept"] = (
+                KEPT_NO_CAPTURE
+                if not sha or state.get("baseline_kept") == KEPT_NO_CAPTURE
+                else KEPT_UNREVIEWED)
             return
         if sha:
             state["baseline_sha"] = sha
             state["head_at_capture"] = head
+            # A Stop review that ends up in another checkout does not use
+            # this baseline.
+            state["baseline_root"] = root
+            state.pop("baseline_kept", None)
+        elif state.get("baseline_sha"):
+            state["baseline_kept"] = KEPT_NO_CAPTURE
+        # When the turn began: what a Stop review in another checkout has
+        # to go on.
+        state["prompt_at"] = captured_at
         # untracked_at_baseline is independent of whether the stash produced
         # a SHA, so compute_v2_review_set's preexisting-untracked exclusion
         # works in untracked-only trees. None means no snapshot was taken
@@ -616,7 +644,10 @@ def handle_user_prompt_submit(input_data):
         # baseline.
         if untracked_now is None:
             state.pop("untracked_at_baseline", None)
-        else:
+        elif not no_repo:
+            # no_repo: the earlier baseline stays (above), and so does the
+            # snapshot that belongs to it. An empty one in its place would
+            # make every untracked file in that repo look new.
             state["untracked_at_baseline"] = untracked_now
     with_locked_state(session_id, _save)
 
@@ -2259,9 +2290,40 @@ def handle_stop_hook(input_data):
             save_repo_hint(session_id, repo_cwd)
         cwd = repo_cwd
 
+    # The baseline belongs to the checkout the prompt hook captured it in.
+    # When the turn ends in another one (the session entered a worktree, or
+    # the edits were in a different repo), it says nothing about what changed
+    # here: this checkout's older commits would look like commits made this
+    # turn, and its files would be diffed against the other checkout's. Use
+    # what this checkout can say for itself instead: its own HEAD when the
+    # turn began (from its reflog) for commits, HEAD for file contents, and
+    # file times for which uncommitted files were already there.
+    origin = None
+    if repo_cwd:
+        try:
+            origin = baseline_origin(repo_cwd, snap_baseline, snap["baseline_root"])
+        except Exception as e:
+            debug_log(f"Stop hook: baseline origin check failed: {e}")
+    foreign_baseline = origin in FOREIGN_ORIGINS
+    since_ns = None
+    if foreign_baseline:
+        at = snap["prompt_at"]
+        at = at if isinstance(at, (int, float)) and 0 < at < 1e11 else None
+        baseline_sha = None
+        head_at_capture = _git_head_at(repo_cwd, at) if at else None
+        untracked_at_baseline = {}
+        since_ns = int(at * 1e9) if at else None
+        debug_log(f"Stop hook: baseline {str(snap_baseline)[:12]} is from another "
+                  f"checkout (origin {origin}); this one was at "
+                  f"{str(head_at_capture)[:12]} when the turn began")
+
     review_paths, diff_base, repo_root, untracked, v2_metrics = compute_v2_review_set(
-        cwd, baseline_sha, head_at_capture, untracked_at_baseline
+        cwd, baseline_sha, head_at_capture, untracked_at_baseline, since_ns=since_ns
     )
+    # Sent even when 0, once git status has worked.
+    if origin is not None and v2_metrics.get("dirty_now_count", -1) >= 0:
+        _TAIL_METRICS["bl_origin"] = baseline_origin_metric(origin, snap["baseline_kept"])
+
     v2_metrics = {**res_metrics, **v2_metrics}
     if not review_paths:
         debug_log("Stop hook: empty review set")
@@ -2368,6 +2430,10 @@ def handle_stop_hook(input_data):
         # Update baseline so next stop hook iteration only sees new changes
         new_sha = None if is_subagent else capture_git_baseline(cwd)
         new_untracked_baseline = _list_untracked(cwd) if new_sha else None
+        # After a baseline from another checkout, the rest of it is replaced
+        # too, below.
+        new_head = (_git_rev_parse_head(cwd)
+                    if new_sha and foreign_baseline and not head_at_capture else None)
 
         def _record_fire(state):
             if is_subagent:
@@ -2392,6 +2458,13 @@ def handle_stop_hook(input_data):
             if new_sha:
                 state["baseline_sha"] = new_sha
                 state["untracked_at_baseline"] = new_untracked_baseline
+                state["baseline_root"] = repo_root
+                state.pop("baseline_kept", None)
+                if foreign_baseline:
+                    # The stored HEAD is the other checkout's. Keep the one
+                    # this review used, so a later Stop this turn still sees
+                    # commits made (or amended) here since the prompt.
+                    state["head_at_capture"] = head_at_capture or new_head
         with_locked_state(session_id, _record_fire)
 
         if new_sha:
