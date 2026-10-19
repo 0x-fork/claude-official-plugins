@@ -2312,7 +2312,9 @@ def handle_stop_hook(input_data):
     off = _llm_review_off(session_id)
     if off:
         debug_log(f"Stop hook: {off[0]}")
-        _skip(3, **off[1])
+        # When the sign-in check gave no answer, this turn's changes are kept
+        # for the next Stop review.
+        _skip(3, restore=llm._gateway_check_unanswered, **off[1])
 
     # Stop-hook-only kill switch — placed after consume_stop_state so
     # touched_paths is still cleared each turn (a disabled Stop hook that

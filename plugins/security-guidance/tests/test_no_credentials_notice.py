@@ -14,6 +14,8 @@ from test_gateway_sign_in import NOT_SIGNED_IN, SIGNED_IN, calls_of, make_cli
 # Anything in the developer's shell that changes whether a review would run.
 _AMBIENT = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    # Makes every session share one state file.
+    "CLAUDE_CODE_REMOTE_SESSION_ID",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",

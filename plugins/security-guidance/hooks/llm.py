@@ -608,6 +608,13 @@ _GATEWAY_STATE_KEY = "gateway_sign_in"
 # The CLI that reviews for a signed-in gateway session, "" when this process
 # decided not to use the gateway route, None before it has decided.
 _gateway_cli: Optional[str] = None
+# True when this process asked the CLI about the sign-in and got no usable
+# answer: the reviews are skipped, but the session may well be signed in.
+_gateway_check_unanswered = False
+# True once a review through the gateway route ran out of time. What makes
+# it do so (a rejected sign-in, a gateway that cannot be reached) does not
+# depend on the model, so the Sonnet attempt is not made after it.
+_gateway_review_timed_out = False
 
 
 def _user_cli_path() -> Optional[str]:
@@ -699,7 +706,7 @@ def gateway_review_cli(session_id) -> Optional[str]:
     no from the CLI is kept for the rest of the session, so signing in or
     out mid-session takes effect in the next one. When the CLI gives no
     usable answer, nothing is saved, so the next hook asks again."""
-    global _gateway_cli
+    global _gateway_cli, _gateway_check_unanswered
     if _gateway_cli is not None:
         return _gateway_cli or None
     cli = _user_cli_path() or ""
@@ -720,6 +727,7 @@ def gateway_review_cli(session_id) -> Optional[str]:
             debug_log(f"gateway check: using this session's saved answer (signed in: {ok})")
         else:
             ok = _gateway_signed_in(cli)
+            _gateway_check_unanswered = ok is None
             if ok is not None:
                 def _save(state):
                     state[_GATEWAY_STATE_KEY] = {"cli": cli, "ok": ok}
@@ -745,7 +753,7 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None,
     No tools (see _only_tools_args) — the security review only needs
     structured output, not Read/Grep/Glob. Single turn keeps cost predictable.
     """
-    global _last_call_claude_http_error
+    global _last_call_claude_http_error, _gateway_review_timed_out
     _last_call_claude_http_error = None
     route = "gateway" if cli_path else "3P"
 
@@ -789,6 +797,8 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None,
     # error (auth missing, model id wrong, etc.) in the debug log instead
     # of just "exit code 1".
     _captured_stderr: List[str] = []
+    # HTTP statuses (or "no response") the CLI said it retried an API request after.
+    _retried_after: set = set()
 
     async def _arun():
         opts = ClaudeAgentOptions(
@@ -821,6 +831,10 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None,
                     structured = msg.structured_output
                 _record_usage(getattr(msg, "usage", None) or {}, chosen_model,
                               cost_usd=getattr(msg, "total_cost_usd", None))
+            elif getattr(msg, "subtype", None) == "api_retry":
+                data = getattr(msg, "data", None)
+                status = data.get("error_status") if isinstance(data, dict) else None
+                _retried_after.add(str(status) if isinstance(status, int) else "no response")
         return structured
 
     # 60s ceiling: a single review request on a healthy 3P endpoint completes
@@ -829,26 +843,34 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None,
     # comes). Bound the wait so a misconfigured 3P session doesn't stall the
     # whole hook. A gateway review gets the 120 s a direct HTTP review gets.
     timeout_s = 120 if route == "gateway" else 60
-    try:
-        result = _run_inner_cli(
-            lambda: _asyncio.run(_asyncio.wait_for(_arun(), timeout=timeout_s)),
-            _captured_stderr)
+
+    def _log_child_stderr():
         if _captured_stderr:
             debug_log(f"{route} sdk-single-turn child stderr ({len(_captured_stderr)} lines):")
             for _l in _captured_stderr[:20]:
                 debug_log(f"  | {_l.rstrip()}")
+
+    try:
+        result = _run_inner_cli(
+            lambda: _asyncio.run(_asyncio.wait_for(_arun(), timeout=timeout_s)),
+            _captured_stderr)
+        _log_child_stderr()
         return result
     except _asyncio.TimeoutError:
-        debug_log(f"{route} sdk-single-turn: timeout after {timeout_s}s")
+        # The CLI retries a refused or unreachable API by itself and reports
+        # each retry in its output, not on stderr.
+        debug_log(f"{route} sdk-single-turn: timeout after {timeout_s}s"
+                  + (f"; the CLI's API requests were retried after status "
+                     f"{', '.join(sorted(_retried_after))}" if _retried_after else ""))
+        _log_child_stderr()
+        if route == "gateway":
+            _gateway_review_timed_out = True
         _last_call_claude_http_error = -1
         _record_http_error(-1)
         return None
     except Exception as e:
         debug_log(f"{route} sdk-single-turn: query failed ({e})")
-        if _captured_stderr:
-            debug_log(f"{route} sdk-single-turn child stderr ({len(_captured_stderr)} lines):")
-            for _l in _captured_stderr[:20]:
-                debug_log(f"  | {_l.rstrip()}")
+        _log_child_stderr()
         _last_call_claude_http_error = -1
         _record_http_error(-1)
         return None
@@ -1061,7 +1083,7 @@ def _call_claude_dual_or(prompt, output_schema, *, bool_key: str, list_key: str,
         r = _call_claude(prompt, output_schema, thinking_budget=thinking_budget,
                          max_tokens=max_tokens, model=primary, retry_5xx=False,
                          cacheable_prefix=cacheable_prefix)
-        if r is None and not explicit:
+        if r is None and not explicit and not _gateway_review_timed_out:
             debug_log(f"single: {primary} failed, falling back to sonnet")
             r = _call_claude(prompt, output_schema, thinking_budget=thinking_budget,
                              max_tokens=max_tokens, model=fallback,
@@ -1072,7 +1094,7 @@ def _call_claude_dual_or(prompt, output_schema, *, bool_key: str, list_key: str,
         r = _call_claude(prompt, output_schema, thinking_budget=thinking_budget,
                          max_tokens=max_tokens, model=primary, retry_5xx=False,
                          cacheable_prefix=cacheable_prefix)
-        if r is None and not explicit:
+        if r is None and not explicit and not _gateway_review_timed_out:
             debug_log(f"dual_or: {primary} leg failed, falling back to sonnet")
             r = _call_claude(prompt, output_schema, thinking_budget=thinking_budget,
                              max_tokens=max_tokens, model=fallback,

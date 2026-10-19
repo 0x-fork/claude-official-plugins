@@ -1,7 +1,9 @@
 """Reviews in a session signed in to a Claude apps gateway with /login, where
 Claude Code gives hooks no credential."""
+import asyncio
 import json
 import sys
+import types
 
 import pytest
 
@@ -59,17 +61,21 @@ def model_of(call):
 
 @pytest.fixture
 def no_credential(monkeypatch, tmp_path):
-    for var in ("SECURITY_REVIEW_MODEL", "CLAUDE_CODE_EXECPATH", *llm._PROVIDER_ENV_VARS):
+    # CLAUDE_CODE_REMOTE_SESSION_ID makes every session share one state file.
+    for var in ("SECURITY_REVIEW_MODEL", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_REMOTE_SESSION_ID",
+                *llm._PROVIDER_ENV_VARS):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("SG_AGENTIC_CLI_PATH", str(tmp_path / "no-claude"))
     monkeypatch.setenv("SECURITY_WARNINGS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(_base, "DEBUG_LOG_FILE", str(tmp_path / "log.txt"))
     monkeypatch.setattr(llm, "HAS_API_CREDENTIALS", False)
-    monkeypatch.setattr(llm, "_gateway_cli", None)
+    new_hook_process(monkeypatch)
 
 
 def new_hook_process(monkeypatch):
     monkeypatch.setattr(llm, "_gateway_cli", None)
+    monkeypatch.setattr(llm, "_gateway_check_unanswered", False)
+    monkeypatch.setattr(llm, "_gateway_review_timed_out", False)
 
 
 class TestGatewaySignInCheck:
@@ -223,6 +229,15 @@ class TestGatewayReviewOutcome:
         assert llm.analyze_code_security([("a.py", "+x = 1\n")], is_diff=True) == (None, [])
         assert llm.last_review_failed()
 
+    def test_failed_review_is_tried_on_sonnet_unless_it_timed_out(self, child, monkeypatch):
+        child.reply = None
+        assert llm.can_review("s1")
+        llm.analyze_code_security([("a.py", "+x = 1\n")], is_diff=True)
+        assert len(child.prompts) == 2
+        monkeypatch.setattr(llm, "_gateway_review_timed_out", True)
+        llm.analyze_code_security([("a.py", "+x = 1\n")], is_diff=True)
+        assert len(child.prompts) == 3 and llm.last_review_failed()
+
     def test_not_signed_in_sends_nothing(self, child, monkeypatch, tmp_path):
         cli, _ = make_cli(tmp_path, NOT_SIGNED_IN, name="signed-out")
         monkeypatch.setenv("SG_AGENTIC_CLI_PATH", str(cli))
@@ -232,9 +247,38 @@ class TestGatewayReviewOutcome:
         assert child.prompts == []
 
 
+def test_timed_out_review_logs_what_the_cli_retried(no_credential, monkeypatch, tmp_path):
+    """The CLI retries a refused sign-in by itself until the plugin's time
+    limit; the retries are in its output, not on stderr."""
+    class Retry:
+        subtype, data = "api_retry", {"error_status": 401}
+
+    async def query(prompt, options):
+        yield Retry()
+        raise asyncio.TimeoutError()
+
+    mod = types.ModuleType("claude_agent_sdk")
+    mod.query = query
+    mod.ClaudeAgentOptions = lambda **kwargs: kwargs
+    mod.AssistantMessage = type("AssistantMessage", (), {})
+    mod.ResultMessage = type("ResultMessage", (), {})
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", mod)
+    cli, _ = make_cli(tmp_path, SIGNED_IN)
+    schema = {"type": "object", "properties": {}}
+    assert llm._call_claude_via_sdk("review this", schema, cli_path=str(cli)) is None
+    assert llm._gateway_review_timed_out is True
+    assert ("gateway sdk-single-turn: timeout after 120s; the CLI's API requests were "
+            "retried after status 401") in (tmp_path / "log.txt").read_text()
+    # Not for the cloud-provider route, where the model can be the reason.
+    monkeypatch.setattr(llm, "_gateway_review_timed_out", False)
+    assert llm._call_claude_via_sdk("review this", schema) is None
+    assert llm._gateway_review_timed_out is False
+
+
 def without_credential(hook_env):
     return {k: v for k, v in hook_env.items()
-            if k not in ("ANTHROPIC_API_KEY", "SECURITY_REVIEW_MODEL", *llm._PROVIDER_ENV_VARS)}
+            if k not in ("ANTHROPIC_API_KEY", "SECURITY_REVIEW_MODEL",
+                         "CLAUDE_CODE_REMOTE_SESSION_ID", *llm._PROVIDER_ENV_VARS)}
 
 
 class TestHooksInASignedInSession:
@@ -332,3 +376,21 @@ class TestHooksInASignedInSession:
             rc, so, se = run_hook(bash_payload(repo, "git commit -m change", out), env)
             assert rc == 0 and metrics_of(so)["skip_reason"] == 22
         assert len(calls_of(calls)) == 1
+
+    def test_unanswered_sign_in_check_keeps_the_turn_for_the_next_stop(
+            self, hook_env, tmp_path, workspace):
+        env = without_credential(hook_env)
+        cli, calls = make_cli(tmp_path, "")
+        env["SG_AGENTIC_CLI_PATH"] = str(cli)
+        _, repo = workspace
+        assert run_hook(ups_payload(repo), env)[0] == 0
+        (repo / "app.py").write_text(VULN_PY)
+        run_hook(edit_payload(repo, repo / "app.py", VULN_PY), env)
+        rc, so, _ = run_hook(stop_payload(repo), env)
+        assert metrics_of(so)["skip_reason"] == 3 and not review_calls(calls)
+        # The CLI answers in the next turn: the first turn's edit is reviewed.
+        make_cli(tmp_path, SIGNED_IN)
+        assert run_hook(ups_payload(repo), env)[0] == 0
+        rc, so, _ = run_hook(stop_payload(repo), env)
+        assert metrics_of(so)["review_failed"] is True
+        assert review_calls(calls)
