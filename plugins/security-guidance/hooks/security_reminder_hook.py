@@ -297,6 +297,10 @@ def emit_metrics(
         cfg = llm.gateway_cfg()
         if cfg:
             tail["gateway_cfg"] = cfg
+    if not llm._send_strict_mcp:
+        # An inner CLI refused --strict-mcp-config (a machine with a
+        # managed-mcp.json) and the review was started again without it.
+        tail["strict_mcp_off"] = 1
     tail.update(_TAIL_METRICS)
     metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}

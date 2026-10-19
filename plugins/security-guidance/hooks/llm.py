@@ -30,7 +30,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Callable
 
 import extensibility
 import review_api
@@ -679,7 +679,9 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
     # comes). Bound the wait so a misconfigured 3P session doesn't stall the
     # whole hook.
     try:
-        result = _asyncio.run(_asyncio.wait_for(_arun(), timeout=60))
+        result = _run_inner_cli(
+            lambda: _asyncio.run(_asyncio.wait_for(_arun(), timeout=60)),
+            _captured_stderr)
         if _captured_stderr:
             debug_log(f"3P sdk-single-turn child stderr ({len(_captured_stderr)} lines):")
             for _l in _captured_stderr[:20]:
@@ -1419,7 +1421,42 @@ def _only_tools_args(tools: Tuple[str, ...] = ()) -> Dict[str, Optional[str]]:
     the permission mode that CLI starts in. Passed as CLI flags because not
     every Agent SDK build that can run a review has a `tools` option.
     """
-    return {"tools": ",".join(tools), "strict-mcp-config": None}
+    args: Dict[str, Optional[str]] = {"tools": ",".join(tools)}
+    if _send_strict_mcp:
+        args["strict-mcp-config"] = None
+    else:
+        # The servers an administrator delivers still start; their tools are
+        # kept from the reviewer.
+        args["disallowedTools"] = "mcp__*"
+    return args
+
+
+# Claude Code exits at startup when given --strict-mcp-config on a machine
+# whose administrator delivers the MCP servers (managed-mcp.json). The flag
+# is sent until an inner CLI refuses it.
+_send_strict_mcp = True
+
+
+def _names_strict_mcp_flag(stderr_line: Any) -> bool:
+    return "--strict-mcp-config" in str(stderr_line)
+
+
+def _run_inner_cli(start: Callable[[], Any], stderr_lines: List[str]) -> Any:
+    """start() runs one inner CLI to its result; stderr_lines receives what
+    that CLI writes to stderr. A start the CLI refused over
+    --strict-mcp-config is made once more without the flag, and the flag is
+    left out for the rest of this process."""
+    global _send_strict_mcp
+    del stderr_lines[:]
+    try:
+        return start()
+    except Exception:
+        if not any(_names_strict_mcp_flag(l) for l in stderr_lines):
+            raise
+        _send_strict_mcp = False
+        debug_log("inner CLI refused --strict-mcp-config; starting it again without the flag")
+        del stderr_lines[:]
+        return start()
 
 
 def _agentic_spawn_env() -> Dict[str, str]:
@@ -1641,11 +1678,19 @@ def _agentic_review(
     # Without a callback the inner CLI writes to this hook's stderr, which
     # Claude Code shows Claude as the review notice. Log it instead.
     child_stderr_lines = [0]
+    # Lines of the current start that name --strict-mcp-config (_run_inner_cli).
+    flag_refusals: List[str] = []
 
     def _child_stderr_metric() -> Dict[str, int]:
         return {"child_stderr": child_stderr_lines[0]} if child_stderr_lines[0] else {}
 
     def _on_child_stderr(line: str) -> None:
+        if _names_strict_mcp_flag(line):
+            # Not counted: where the flag is refused, every review gets this
+            # line once, from the start that is then made again.
+            flag_refusals.append(str(line))
+            debug_log(f"agentic reviewer's CLI stderr | {str(line).rstrip()}")
+            return
         child_stderr_lines[0] += 1
         metrics["child_stderr"] = child_stderr_lines[0]
         if child_stderr_lines[0] <= 20:
@@ -1756,7 +1801,9 @@ def _agentic_review(
 
     def _run(system: str, prompt: str, *, schema: Dict[str, Any]
              ) -> Tuple[Optional[Dict[str, Any]], int, Optional[str]]:
-        return _asyncio.run(_arun(system, prompt, schema=schema))
+        return _run_inner_cli(
+            lambda: _asyncio.run(_arun(system, prompt, schema=schema)),
+            flag_refusals)
 
     # Stage 1: investigate — SDK enforces _FINDINGS_SCHEMA and retries the
     # agent on mismatch, so `inv` is either a validated dict or None.
