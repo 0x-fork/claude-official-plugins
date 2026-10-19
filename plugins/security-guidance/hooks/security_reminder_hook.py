@@ -2323,6 +2323,9 @@ def handle_stop_hook(input_data):
     diff_files = filter_preexisting_from_diff(diff_files, cwd, baseline_sha)
 
     debug_log(f"Stop hook: reviewing {len(diff_files)} changed files (standard diff)")
+    secret_named = gitutil.count_secret_named(diff_files)
+    if secret_named:
+        _TAIL_METRICS["secret_named_reviewed"] = secret_named
 
     import time as _time
     stop_review_start = _time.time()
