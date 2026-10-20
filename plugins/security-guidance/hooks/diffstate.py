@@ -17,6 +17,7 @@ from gitutil import (
     _git_rev_parse_head, _is_ancestor, _git_name_only, _temp_index,
 )
 from session_state import with_locked_state
+from extensibility import _same_dir
 
 
 # =====================================================================
@@ -96,6 +97,10 @@ def consume_stop_state(session_id, clear=True):
             "touched_paths": list(state.get("touched_paths", [])),
             "baseline_sha": state.get("baseline_sha"),
             "head_at_capture": state.get("head_at_capture"),
+            # Where and when the prompt hook captured it; see baseline_origin.
+            "baseline_root": state.get("baseline_root"),
+            "prompt_at": state.get("prompt_at"),
+            "baseline_kept": state.get("baseline_kept") or 0,
             "untracked_at_baseline": (
                 dict(state["untracked_at_baseline"])
                 if isinstance(state.get("untracked_at_baseline"), dict) else {}
@@ -117,7 +122,8 @@ def consume_stop_state(session_id, clear=True):
 
     return with_locked_state(session_id, _snap) or {
         "touched_paths": [], "baseline_sha": None, "head_at_capture": None,
-        "untracked_at_baseline": {},
+        "untracked_at_baseline": {}, "baseline_root": None, "prompt_at": None,
+        "baseline_kept": 0,
         "fire_count": 0, "fire_count_expired": False, "previous_findings": [],
         "reviewed_diff_hash": None, "state_resets": 0, "state_overwrites": 0,
     }
@@ -151,6 +157,48 @@ def restore_unreviewed_stop_state(session_id, paths, baseline_sha):
         if baseline_sha and not state.get("baseline_sha"):
             state["baseline_sha"] = baseline_sha
     with_locked_state(session_id, _restore)
+
+
+# state["baseline_kept"]: why a prompt left an earlier turn's baseline in
+# place. Only telemetry reads it.
+KEPT_NO_CAPTURE = 1   # it could not capture one (not a repo, or git failed)
+KEPT_UNREVIEWED = 2   # the previous turn's edits were never reviewed
+
+# baseline_origin() values that mean "captured in another checkout".
+FOREIGN_ORIGINS = (1, 2, 3)
+
+
+def baseline_origin(repo_root, baseline_sha, baseline_root):
+    """Where the session's baseline was captured, relative to the checkout a
+    Stop review is about to read (`repo_root`):
+
+        0  that checkout (or the origin was not recorded)
+        1  another worktree of the same repository
+        2  another repository
+        3  another folder, which is gone or cannot be read as a checkout
+        4  there is no baseline
+
+    `baseline_root` is the repo root the prompt hook stored beside the SHA."""
+    if not baseline_sha:
+        return 4
+    if not baseline_root or not isinstance(baseline_root, str):
+        return 0
+    if _same_dir(baseline_root, repo_root):
+        return 0
+    if not os.path.isdir(baseline_root):
+        return 3
+    here, there = _git_dir(repo_root), _git_dir(baseline_root)
+    if not here or not there:
+        return 3
+    return 1 if _same_dir(here, there) else 2
+
+
+def baseline_origin_metric(origin, kept):
+    """The `bl_origin` number on Stop rows: baseline_origin, plus 10 or 20
+    (KEPT_*) when the baseline is an earlier turn's."""
+    if origin == 4 or kept not in (KEPT_NO_CAPTURE, KEPT_UNREVIEWED):
+        return origin
+    return origin + 10 * kept
 
 
 def get_baseline_file_content(session_id, file_path, cwd):
@@ -605,7 +653,8 @@ def _list_untracked(cwd):
         debug_log(f"_list_untracked error: {e}")
         return {}
 
-def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_baseline=None):
+def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_baseline=None,
+                          since_ns=None):
     """v2 diff strategy: derive the review set from git state alone.
 
     review_set = (files dirty vs current HEAD, plus files committed this turn
@@ -619,6 +668,10 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
     snapshot a pre-existing untracked file looks "new since baseline" forever.
     A file is excluded only if it was untracked at baseline AND its mtime is
     unchanged — an in-place edit during the turn is still reviewed.
+
+    since_ns: for a checkout the prompt hook took no baseline or snapshot of
+    (the turn moved into it), the time the turn began. A dirty or untracked
+    file last written before then was already that way and is left out.
 
     Known limitation: a Bash-only turn that's interrupted before Stop fires
     leaves touched_paths empty, so the next UPS re-baselines past those edits.
@@ -662,6 +715,16 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
         return max(st.st_mtime_ns, st.st_ctime_ns) < capped_at_ns - _CAPPED_BASELINE_SLACK_NS
 
     preexisting_unchanged = {p for p in untracked if _unchanged_since_baseline(p)}
+    if since_ns:
+        def _written_before_turn(p):
+            try:
+                st = os.stat(os.path.join(repo, p))
+            except OSError:
+                return False
+            return max(st.st_mtime_ns, st.st_ctime_ns) < since_ns - _CAPPED_BASELINE_SLACK_NS
+
+        preexisting_unchanged |= {p for p in untracked if _written_before_turn(p)}
+        tracked_dirty = {p for p in tracked_dirty if not _written_before_turn(p)}
     new_untracked = untracked - preexisting_unchanged
     dirty_now = tracked_dirty | new_untracked
 
