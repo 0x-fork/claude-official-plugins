@@ -197,7 +197,9 @@ class TestGetGitDiff:
     def test_batches_shrink_to_a_lower_system_limit(self, monkeypatch):
         monkeypatch.setattr(os, "sysconf", lambda name: 100000, raising=False)
         budget = gitutil._path_args_budget({"A": "b" * 9997})
-        assert budget == 45000
+        # Half of what the environment leaves, or the platform figure where
+        # that is lower (Windows).
+        assert budget == min(45000, gitutil._MAX_PATH_ARGS_BYTES)
         paths = [f"dir/file_{i}.py" for i in range(10000)]
         assert all(sum(len(p) + 9 for p in b) <= budget
                    for b in gitutil._path_batches(paths, budget))
