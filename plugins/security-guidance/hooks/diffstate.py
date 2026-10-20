@@ -351,7 +351,8 @@ def capture_git_baseline(cwd):
         sha = ""
         # untracked_paths=[]: a plain copy of the index, no `add -N` pass.
         with _temp_index(cwd, untracked_paths=[]) as env:
-            # env is None when there is no index file to copy: treat as clean.
+            # env is None when no usable index copy could be made: fall
+            # back to HEAD.
             if env is not None:
                 result = subprocess.run(
                     [*GIT_CMD, "stash", "create"],

@@ -55,9 +55,9 @@ GIT_CMD = [
     # vendored checkout, an unpacked archive) is another repository with its
     # own config. To report it as modified, or to show its changes inline
     # (diff.submodule=diff), git starts a second git inside it, which reads
-    # that config and runs the commands it names. The hook stays out of it:
-    # such a directory is left out of the review set, and a commit that moves
-    # one shows as the two commit ids.
+    # that config and runs the commands it names. Such a directory is left
+    # out of the review set, and so is a commit that moves one. See also
+    # _drop_gitlinks for the commands that take no such setting.
     "-c", "diff.ignoreSubmodules=all",
     "-c", "diff.submodule=short",
 ]
@@ -146,6 +146,35 @@ def _find_git_index(cwd):
         return index_path if os.path.isfile(index_path) else None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
+
+
+def _find_git_index_and_top(cwd):
+    """_find_git_index plus the work tree's top directory, from one git
+    call. (None, None) when either is missing: no index file, a bare
+    repository, or a `cwd` inside the git directory."""
+    try:
+        result = subprocess.run(
+            [*GIT_CMD, "rev-parse", "--git-dir", "--show-toplevel"],
+            cwd=cwd, capture_output=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None, None
+        # Paths as bytes from git: decode by hand (see _find_git_index).
+        out = result.stdout.decode("utf-8", errors="replace")
+        parts = out[:-1].split("\n") if out.endswith("\n") else []
+        if len(parts) != 2 or not all(parts):
+            # A newline in one of the paths: ask for them one at a time.
+            index_path, top = _find_git_index(cwd), _git_toplevel(cwd)
+            return (index_path, top) if index_path and top else (None, None)
+        git_dir, top = parts
+        if not os.path.isabs(git_dir):
+            git_dir = os.path.join(cwd, git_dir)
+        index_path = os.path.join(git_dir, "index")
+        if not os.path.isfile(index_path):
+            return None, None
+        return index_path, top
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None, None
 
 
 def _diff_pathspec(cwd, paths):
@@ -403,9 +432,11 @@ def _temp_index(cwd, untracked_paths=None):
     """Yield an env dict pointing GIT_INDEX_FILE at a throwaway copy of the
     repo's index with `git add --intent-to-add` applied, so untracked files
     show up in subsequent `git diff` calls without touching the user's real
-    index. Yields None if no index can be found (bare repo / not a repo) or
-    no copy slot came free; the caller should fall back to a plain diff.
-    Always cleans up the temp file.
+    index. The copy has no gitlink entry for a nested repository (see
+    _drop_gitlinks). Yields None if no index can be found (bare repo / not a
+    repo), no copy slot came free, or those entries could not be removed.
+    Callers then go on without the copy: the diff reads the real index, and
+    the baseline falls back to HEAD. Always cleans up the temp file.
 
     Perf: when `untracked_paths` is given, only those paths are added (O(n)
     in untracked count). The default `add -N .` stats every file in the
@@ -416,7 +447,7 @@ def _temp_index(cwd, untracked_paths=None):
     Cleanup removes `<tmp_index>*`, not just the copy: git writes
     `<index>.lock` and `<index>.stash.<pid>` next to the index it is given and
     cannot remove them itself when a subprocess timeout kills it."""
-    real_index = _find_git_index(cwd)
+    real_index, top = _find_git_index_and_top(cwd)
     if not real_index:
         yield None
         return
@@ -432,12 +463,12 @@ def _temp_index(cwd, untracked_paths=None):
             debug_log("no index copy slot came free; going without a copy")
             yield None
             return
-        with _copied_index(cwd, real_index, tmpdir, untracked_paths) as env:
+        with _copied_index(cwd, top, real_index, tmpdir, untracked_paths) as env:
             yield env
 
 
 @contextlib.contextmanager
-def _copied_index(cwd, real_index, tmpdir, untracked_paths):
+def _copied_index(cwd, top, real_index, tmpdir, untracked_paths):
     import shutil
     import tempfile
 
@@ -459,6 +490,12 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
         except (OSError, NotImplementedError, AttributeError):
             shutil.copy2(real_index, tmp_index)
         env = {**os.environ, "GIT_INDEX_FILE": tmp_index}
+        # Before `git add` runs, since add reads the gitlinks its paths cover.
+        if not _drop_gitlinks(top, env, tmp_index):
+            debug_log("could not remove gitlinks from the index copy; going on "
+                      "without the copy")
+            yield None
+            return
         if untracked_paths is None:
             add_args = ["."]
         elif untracked_paths:
@@ -483,12 +520,144 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
             subprocess.run(
                 [*GIT_CMD, "add", "--intent-to-add"] + add_args,
                 cwd=cwd, capture_output=True, timeout=10,
-                env=env,
+                # The paths are file names, not patterns, for this git add
+                # only: an untracked file named `:(glob)**` must add only
+                # itself.
+                env={**env, "GIT_LITERAL_PATHSPECS": "1"},
             )
+            # A whole-tree add puts a nested repository back.
+            if untracked_paths is None and not _drop_gitlinks(top, env, tmp_index):
+                yield None
+                return
         yield env
     finally:
         _remove_copy(tmp_index)
         _live_copies.discard(tmp_index)
+
+
+# An index entry stores its mode as four bytes; this is a gitlink's.
+_GITLINK_MODE = b"\x00\x00\xe0\x00"
+# Signature of the index extension that says most entries are in a second,
+# shared file (core.splitIndex).
+_SPLIT_INDEX_EXT = b"link"
+
+
+def _may_have_gitlinks(index_path):
+    """False only when the index file at `index_path` cannot hold a gitlink
+    entry: neither a gitlink's mode bytes nor the split-index signature occur
+    anywhere in it. Either can occur by chance (in an object id, a file
+    size, a path), so True means "list the entries and see". Most
+    repositories have no gitlink, and for them this saves a git process on
+    every index copy."""
+    keep = max(len(_GITLINK_MODE), len(_SPLIT_INDEX_EXT)) - 1
+    try:
+        with open(index_path, "rb") as f:
+            tail = b""
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    return False
+                data = tail + chunk
+                if _GITLINK_MODE in data or _SPLIT_INDEX_EXT in data:
+                    return True
+                tail = data[-keep:]
+    except OSError:
+        return True
+
+
+_GITLINK_LIST_TIMEOUT = 10
+# `git ls-files --sparse` (git 2.35) lists a sparse index as it is stored;
+# without it git first expands the index to every path in the repository.
+# Set to False once this git has refused the option.
+_ls_files_sparse = True
+
+
+def _gitlink_paths(top, env):
+    """Paths (bytes, relative to `top`) of the gitlink entries, at any depth,
+    in the index `env` names. None if they could not be listed. The listing
+    is read as it comes, so a large index costs time but not memory."""
+    global _ls_files_sparse
+    cmd = [*GIT_CMD, "ls-files", "-s", "-z"] + (["--sparse"] if _ls_files_sparse else [])
+    p = subprocess.Popen(cmd, cwd=top, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env)
+    killer = threading.Timer(_GITLINK_LIST_TIMEOUT, p.kill)
+    killer.daemon = True
+    found = set()
+    tail = b""
+    try:
+        killer.start()
+        while True:
+            chunk = p.stdout.read1(65536)
+            if not chunk:
+                break
+            data = tail + chunk
+            end = data.rfind(b"\0") + 1
+            # "<mode> <object> <stage>\t<path>", NUL-terminated. Most chunks
+            # have no gitlink and are not split up.
+            if b"160000 " in data:
+                for rec in data[:end].split(b"\0"):
+                    if rec.startswith(b"160000 "):
+                        found.add(rec.split(b"\t", 1)[1])
+            tail = data[end:]
+        rc = p.wait()
+    finally:
+        killer.cancel()
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+        p.stdout.close()
+    if rc == 129 and _ls_files_sparse:
+        # Usage error: a git without --sparse.
+        _ls_files_sparse = False
+        return _gitlink_paths(top, env)
+    if rc != 0:
+        debug_log(f"git ls-files on the index copy failed (rc={rc})")
+        return None
+    return found
+
+
+def _drop_gitlinks(top, env, tmp_index):
+    """Remove the gitlink (mode 160000) entry of every nested repository from
+    the index copy that `env` names, never from the real index, before
+    anything else runs on the copy. A gitlink marks a directory that is, or
+    can be, another repository (see diff.ignoreSubmodules in GIT_CMD):
+    `git stash create` takes no flag like IGNORE_SUBMODULES, and `git add`
+    reads the gitlinks its paths cover. An entry whose directory has no
+    `.git` stays: git starts nothing there, and without the entry an older
+    `git stash create` fails on the empty directory. `top` is the work
+    tree's top directory. Returns True on success, False on any failure; the
+    copy must not be used then."""
+    try:
+        if not _may_have_gitlinks(tmp_index):
+            return True
+        gitlinks = _gitlink_paths(top, env)
+        if gitlinks is None:
+            return False
+        top_b = os.fsencode(top)
+        nested = sorted(p for p in gitlinks
+                        if os.path.lexists(os.path.join(top_b, p, b".git")))
+        if not nested:
+            return True
+        mtime_ns = os.stat(tmp_index).st_mtime_ns
+        # git writes a new file and renames it over the copy, so a copy that
+        # is a hard link to the real index leaves the real one as it was.
+        rm = subprocess.run(
+            [*GIT_CMD, "update-index", "--force-remove", "-z", "--stdin"],
+            cwd=top, input=b"".join(p + b"\0" for p in nested),
+            capture_output=True, timeout=10, env=env)
+        if rm.returncode != 0:
+            debug_log(f"git update-index on the index copy failed (rc={rm.returncode}): "
+                      f"{rm.stderr[:200].decode('utf-8', errors='replace')}")
+            return False
+        # Keep the mtime the copy came with; see _copied_index.
+        os.utime(tmp_index, ns=(mtime_ns, mtime_ns))
+        debug_log(f"gitlink entries (nested repositories) removed from the "
+                  f"index copy: {len(nested)}; their contents are not reviewed")
+        return True
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as e:
+        # RuntimeError: the timer thread could not start.
+        debug_log(f"removing gitlinks from the index copy failed: {e}")
+        return False
 
 
 def _git_toplevel(cwd):
