@@ -86,7 +86,7 @@ from _base import (  # noqa: E402,F401
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
     _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
     _USAGE_CONTEXT, _log_usage,
-    state_dir as _resolve_state_dir,
+    launcher_probe_metrics, state_dir as _resolve_state_dir,
     write_hook_output as _write_hook_output,
     llm_reviews_switched_off, agent_sdk_installed,
 )
@@ -213,6 +213,9 @@ CONTINUATION_SUFFIX = (
 # Extra keys emit_metrics appends to every row this invocation emits.
 _TAIL_METRICS: Dict[str, Any] = {}
 
+# The launcher's slow interpreter probes, if any. After everything else.
+_LAUNCHER_METRICS: Dict[str, Any] = launcher_probe_metrics()
+
 # Reviewer context diagnostics from llm.agentic_review, most useful first.
 _REVIEWER_CONTEXT_KEYS = ("rv_cwd_gone", "rv_tool_err", "rv_tool_calls")
 
@@ -310,6 +313,7 @@ def emit_metrics(
         # managed-mcp.json) and the review was started again without it.
         tail["strict_mcp_off"] = 1
     tail.update(_TAIL_METRICS)
+    tail.update(_LAUNCHER_METRICS)
     metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}
     if rewake_summary:
@@ -2919,6 +2923,7 @@ def main():
                 "rule_id": int(_RULE_NAME_TO_ID.get(raw_names[0], -1)),
                 "rule_mask": rule_names_to_mask(raw_names),
                 **({"pv": _PV} if _PV else {}),
+                **_LAUNCHER_METRICS,
             }
         if all_guidance:
             output["hookSpecificOutput"] = {
