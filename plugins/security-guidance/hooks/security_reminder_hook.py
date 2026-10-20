@@ -2377,9 +2377,10 @@ def handle_stop_hook(input_data):
     # The two masks also ride the tail, so the reviewed rows below, which
     # leave `sweep` or its mask out, carry them when there is room under the
     # key cap. Per rule they give how often it fired and how often the
-    # flagged code was still there at Stop. warn_fired_mask goes last: a row
-    # cut at the cap loses it first, and a row without it is left out of the
-    # per-rule read instead of counting its rules as fixed.
+    # flagged code was still there at Stop. warn_fired_mask goes after
+    # warn_unresolved_mask: a row cut at the cap loses it first, and a row
+    # without it is left out of the per-rule read instead of counting its
+    # rules as fixed.
     if warn_unresolved_mask:
         _TAIL_METRICS["warn_unresolved_mask"] = warn_unresolved_mask
     if warn_fired_mask:

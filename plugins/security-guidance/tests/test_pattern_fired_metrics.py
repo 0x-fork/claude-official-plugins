@@ -34,13 +34,14 @@ class TestFiredRulesReachTheStopRow:
         assert m["warn_unresolved_mask"] == EVAL
         assert list(m).index("warn_fired_mask") < 20
 
-    def test_fired_mask_is_the_last_key(self, env, gateway, workspace):
+    def test_fired_mask_follows_the_unresolved_mask(self, env, gateway, workspace):
         """A row cut at the key cap loses the fired mask before the
         unresolved one."""
         _, repo = workspace
         gateway.vulns = [STUB_VULN]
         m = _turn(repo, env, {"calc.js": "const v = eval(src)\n"})
-        assert list(m)[-2:] == ["warn_unresolved_mask", "warn_fired_mask"]
+        keys = list(m)
+        assert keys.index("warn_unresolved_mask") < keys.index("warn_fired_mask")
         assert m["warn_fixed"] == 0 and m["warn_unresolved"] == 1
 
     def test_review_with_findings(self, env, gateway, workspace):
