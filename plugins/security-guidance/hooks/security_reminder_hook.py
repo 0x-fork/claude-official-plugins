@@ -49,7 +49,9 @@ Other:
 - SECURITY_REVIEW_MODEL: Model for LLM review (default: the newest Opus)
 - ANTHROPIC_API_KEY: Required for LLM-based reviews
 - ANTHROPIC_AUTH_TOKEN: Alternative to API key — OAuth access token sent as Bearer auth.
-  Claude Code passes this automatically for OAuth-authenticated users.
+  Claude Code passes this to the plugin's hooks for signed-in users, unless
+  telemetry or nonessential traffic is turned off. With neither, the LLM
+  reviews are skipped and the user is told once (see README, Credentials).
 """
 
 try:
@@ -86,6 +88,7 @@ from _base import (  # noqa: E402,F401
     _USAGE_CONTEXT, _log_usage,
     state_dir as _resolve_state_dir,
     write_hook_output as _write_hook_output,
+    llm_reviews_switched_off, agent_sdk_installed,
 )
 import extensibility  # noqa: E402
 from patterns import (  # noqa: E402,F401
@@ -102,6 +105,7 @@ from gitutil import (  # noqa: E402,F401
     GIT_CMD, apply_safe_git_env, remove_copies_on_termination,
     _git_rev_parse_head, _find_git_index, _diff_pathspec, _temp_index,
     _git_toplevel, _git_dir, _git_rev_list_range, _git_diff_range,
+    _git_toplevel_and_head, _git_head_at,
     _detect_main_branch, _git_reflog_recent_commits, _git_name_only,
     _git_status_porcelain, _is_ancestor, get_git_diff,
     SOURCE_CODE_EXTENSIONS, SOURCE_CODE_BASENAMES,
@@ -121,6 +125,9 @@ from diffstate import (  # noqa: E402,F401
     _reviewed_shas_path, _load_reviewed_shas, _append_reviewed_shas,
     _full_shas, _mark_inflight, _load_inflight_shas, _reviewed_after_inflight,
     UNTRACKED_BASELINE_CAP, _list_untracked, compute_v2_review_set,
+    touched_scope, review_scope_code,
+    baseline_origin, baseline_origin_metric, FOREIGN_ORIGINS,
+    KEPT_NO_CAPTURE, KEPT_UNREVIEWED,
 )
 from reporesolve import (  # noqa: E402,F401
     RES_NONE, RES_CWD, RES_COMMAND, RES_SHA_SCAN, RES_TOUCHED_PATHS, RES_HINT,
@@ -128,6 +135,7 @@ from reporesolve import (  # noqa: E402,F401
     toplevel_from_command, repo_containing_commit, scan_roots,
     resolve_repo_root, save_repo_hint, load_repo_hint,
 )
+import diffstate  # noqa: E402  module ref for last_baseline_fail
 import gitutil  # noqa: E402  module ref for per-run counters
 import llm  # noqa: E402  module ref for reassignable globals (_last_call_claude_http_error etc.)
 from llm import (  # noqa: E402,F401
@@ -297,6 +305,10 @@ def emit_metrics(
         cfg = llm.gateway_cfg()
         if cfg:
             tail["gateway_cfg"] = cfg
+    if not llm._send_strict_mcp:
+        # An inner CLI refused --strict-mcp-config (a machine with a
+        # managed-mcp.json) and the review was started again without it.
+        tail["strict_mcp_off"] = 1
     tail.update(_TAIL_METRICS)
     metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}
@@ -313,6 +325,81 @@ def emit_metrics(
     if system_message:
         out["systemMessage"] = system_message
     _write_hook_output(out)
+
+
+def _llm_review_off(session_id):
+    """Why no LLM review can run: (log text, extra metrics), or None."""
+    if not ENABLE_CODE_SECURITY_REVIEW:
+        return "LLM review disabled", {}
+    if not llm.can_review(session_id):
+        return ("no API credentials and no Claude apps gateway sign-in",
+                {"no_creds": True})
+    return None
+
+
+# Claude Code hands a signed-in user's credentials to this plugin's hooks,
+# but not in a session started with one of these set.
+_NO_CREDENTIALS_NOTICE_INTERVAL_SEC = 7 * 24 * 3600
+
+
+def _credential_withholding_env_vars():
+    names = [v for v in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                         "DISABLE_TELEMETRY") if os.environ.get(v)]
+    if os.environ.get("DO_NOT_TRACK", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        names.append("DO_NOT_TRACK")
+    return names
+
+
+def _no_credentials_notice(file_path, session_id):
+    """Text telling the user the LLM reviews are not running, or None.
+
+    With no credential and no Claude apps gateway sign-in, every Stop,
+    commit and push review is skipped, and nothing else tells the user.
+    Returned for an edit inside a git repo (the reviews only look at those),
+    at most once a week per install: the marker file in the state dir holds
+    the time of the last notice, or of the last check that found the reviews
+    running through a Claude apps gateway sign-in. A marker that can't be
+    written means no notice rather than one on every edit. The caller is the
+    Edit/Write hook because the review hooks run in the background, where
+    Claude Code does not show a systemMessage.
+    """
+    import time as _time
+    try:
+        marker = os.path.join(_resolve_state_dir(), ".no_credentials_notice")
+        try:
+            age = _time.time() - os.path.getmtime(marker)
+            if 0 <= age < _NO_CREDENTIALS_NOTICE_INTERVAL_SEC:
+                return None
+        except OSError:
+            pass
+        if not _git_toplevel(os.path.dirname(os.path.abspath(file_path))):
+            return None
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w"):
+            pass
+        # In a session signed in to a Claude apps gateway the reviews do run,
+        # through the user's claude (llm.gateway_review_cli). `claude auth
+        # status` runs only after the marker is written, so an edit waits for
+        # it at most once a week.
+        if llm.can_review(session_id):
+            return None
+    except OSError:
+        return None
+    withheld_by = _credential_withholding_env_vars()
+    if withheld_by:
+        why = ("Claude Code does not pass your sign-in to plugins while "
+               + " or ".join(withheld_by) + " is set")
+    else:
+        why = "No Anthropic credentials were passed to the plugin's hooks"
+    rest = (", so only the pattern warnings on edits are active"
+            if ENABLE_PATTERN_RULES else "")
+    return (
+        "security-guidance: the AI security review of your changes is not "
+        f"running. {why}{rest}. See \"Credentials\" in the plugin README. "
+        "Set ENABLE_CODE_SECURITY_REVIEW=0 to turn the review off and hide "
+        "this notice, which is shown at most once a week."
+    )
 
 # =====================================================================
 # State management
@@ -472,10 +559,29 @@ def sweep_pending_warnings(session_id):
 # Pattern matching
 # =====================================================================
 
+def _notebook_cell_sources(content):
+    """Cell sources of a saved notebook, or None when content is not one (a
+    single cell's source, say)."""
+    if not isinstance(content, str) or not content.lstrip("\ufeff \t\r\n").startswith("{"):
+        return None
+    try:
+        sources = [cell.get("source", "") for cell in json.loads(content.lstrip("\ufeff"))["cells"]]
+        return "\n".join(src if isinstance(src, str) else "".join(src) for src in sources)
+    except Exception:
+        return None
+
 def check_patterns(file_path, content):
     """Check if file path or content matches any security patterns. Returns ALL matches."""
     normalized_path = file_path.lstrip("/")
     matches = []
+
+    # A saved notebook is JSON: its string escapes hide code from the rules
+    # ("\nos.system(" has no word boundary) and its outputs can run to
+    # megabytes. Check the cells as written instead.
+    if normalized_path.endswith(".ipynb"):
+        cell_sources = _notebook_cell_sources(content)
+        if cell_sources is not None:
+            content = cell_sources
 
     for pattern in list(SECURITY_PATTERNS) + extensibility.user_patterns():
         # path_filter is a gate: when present, the rule only applies to
@@ -515,7 +621,7 @@ def check_patterns(file_path, content):
 
     return matches
 
-def extract_content_from_input(tool_name, tool_input):
+def extract_content_from_input(tool_name, tool_input, tool_response=None):
     """Extract content to check from tool input based on tool type."""
     if tool_name == "Write":
         return tool_input.get("content", "")
@@ -526,11 +632,28 @@ def extract_content_from_input(tool_name, tool_input):
         if edits:
             return " ".join(edit.get("new_string", "") for edit in edits)
         return ""
+    elif tool_name == "NotebookEdit":
+        # A deleted cell adds no code. A failed edit comes back as an error
+        # in the response, with the notebook unchanged.
+        if tool_input.get("edit_mode") == "delete":
+            return ""
+        if isinstance(tool_response, dict) and tool_response.get("error"):
+            return ""
+        new_source = tool_input.get("new_source", "")
+        return new_source if isinstance(new_source, str) else ""
     return ""
 
 # =====================================================================
 # Hook handlers
 # =====================================================================
+
+def _store_baseline_fail(state, fail):
+    """Keep diffstate.last_baseline_fail next to the baseline_sha it describes."""
+    if fail:
+        state["baseline_fail"] = fail
+    else:
+        state.pop("baseline_fail", None)
+
 
 def handle_user_prompt_submit(input_data):
     """
@@ -575,14 +698,25 @@ def handle_user_prompt_submit(input_data):
             # something tracked is dirtied.
             return _f_sha.result(), _f_ut.result() or {}
 
+    import time as _time
+    captured_at = _time.time()
     sha, untracked_now = _capture(cwd)
+    # No repo here and none remembered: the listing above failed, it did not
+    # come back empty.
+    no_repo = False
     if not sha and not _git_toplevel(cwd):
         hint = load_repo_hint(session_id)
         if hint:
             debug_log(f"UPS: cwd is not a git repo; using repo hint {hint!r}")
             cwd = hint
             sha, untracked_now = _capture(cwd)
-    head = _git_rev_parse_head(cwd)
+        else:
+            no_repo = True
+    baseline_fail = diffstate.last_baseline_fail
+    # The repo root rides on the same git call as HEAD.
+    root, head = (None, None) if no_repo else _git_toplevel_and_head(cwd)
+    if sha and not head:
+        head = _git_rev_parse_head(cwd)
 
     # If the previous turn's Stop hook never ran (user interrupt, follow-up
     # during work, tool-reject, model crash, maxTurns, PostToolUse block…),
@@ -605,10 +739,27 @@ def handle_user_prompt_submit(input_data):
             # untracked file in the tree as written this turn.
             if untracked_now is not None and "untracked_at_baseline" not in state:
                 state["untracked_at_baseline"] = untracked_now
+            # Once a prompt failed to capture, the baseline is old whatever
+            # later prompts did.
+            state["baseline_kept"] = (
+                KEPT_NO_CAPTURE
+                if not sha or state.get("baseline_kept") == KEPT_NO_CAPTURE
+                else KEPT_UNREVIEWED)
             return
         if sha:
             state["baseline_sha"] = sha
             state["head_at_capture"] = head
+            state.pop("turn_touched", None)
+            _store_baseline_fail(state, baseline_fail)
+            # A Stop review that ends up in another checkout does not use
+            # this baseline.
+            state["baseline_root"] = root
+            state.pop("baseline_kept", None)
+        elif state.get("baseline_sha"):
+            state["baseline_kept"] = KEPT_NO_CAPTURE
+        # When the turn began: what a Stop review in another checkout has
+        # to go on.
+        state["prompt_at"] = captured_at
         # untracked_at_baseline is independent of whether the stash produced
         # a SHA, so compute_v2_review_set's preexisting-untracked exclusion
         # works in untracked-only trees. None means no snapshot was taken
@@ -616,7 +767,10 @@ def handle_user_prompt_submit(input_data):
         # baseline.
         if untracked_now is None:
             state.pop("untracked_at_baseline", None)
-        else:
+        elif not no_repo:
+            # no_repo: the earlier baseline stays (above), and so does the
+            # snapshot that belongs to it. An empty one in its place would
+            # make every untracked file in that repo look new.
             state["untracked_at_baseline"] = untracked_now
     with_locked_state(session_id, _save)
 
@@ -1138,6 +1292,12 @@ def _review_failure_reason(status):
     if llm._is_3p_provider():
         return ("provider", "the review through the cloud provider got no answer",
                 "The plugin's log has the provider's error.")
+    if llm._gateway_cli:
+        pinned = os.environ.get("SECURITY_REVIEW_MODEL", "").strip()
+        return ("gateway", "the review through Claude Code on the Claude apps gateway returned no result",
+                "The plugin's log has the reason. If it says the sign-in has expired, run /login again."
+                + (f" SECURITY_REVIEW_MODEL ({pinned}) may also name a model the gateway does "
+                   "not serve." if pinned else ""))
     if status == 401:
         return ("auth", "the API rejected the plugin's credentials (HTTP 401)",
                 f"The sign-in may have expired or been revoked{gateway}.")
@@ -1330,9 +1490,10 @@ def handle_commit_review_posttooluse(input_data):
         emit_metrics({"skipped": True, "skip_reason": 32, **_base})
         sys.exit(0)
 
-    if not ENABLE_CODE_SECURITY_REVIEW or not HAS_API_CREDENTIALS:
-        debug_log("Commit review: LLM review disabled or no API credentials")
-        emit_metrics({"skipped": True, "skip_reason": 22, **_base})
+    off = _llm_review_off(session_id)
+    if off:
+        debug_log(f"Commit review: {off[0]}")
+        emit_metrics({"skipped": True, "skip_reason": 22, **off[1], **_base})
         sys.exit(0)
 
     if not ensure_anthropic_reachable():
@@ -1798,8 +1959,9 @@ def handle_push_sweep_posttooluse(input_data):
     if interrupted:
         emit_metrics({"skipped": True, "skip_reason": 21, **_base})
         sys.exit(0)
-    if not ENABLE_CODE_SECURITY_REVIEW or not HAS_API_CREDENTIALS:
-        emit_metrics({"skipped": True, "skip_reason": 22, **_base})
+    off = _llm_review_off(session_id)
+    if off:
+        emit_metrics({"skipped": True, "skip_reason": 22, **off[1], **_base})
         sys.exit(0)
     if not cwd:
         emit_metrics({"skipped": True, "skip_reason": 25, **_base})
@@ -2136,6 +2298,14 @@ def handle_push_sweep_posttooluse(input_data):
                  hook_event_name="PostToolUse")
     sys.exit(2)
 
+def _stop_diff_truncated():
+    """Bytes of reviewable diff the Stop review did not send: cut while
+    reading git's output, plus what the prompt caps dropped after that.
+    As the metric to emit, or nothing when there were none."""
+    n = llm._last_review_truncated_bytes + gitutil._diff_read["cut_bytes"]
+    return {"diff_truncated": n} if n else {}
+
+
 def handle_stop_hook(input_data):
     """
     Handle the Stop hook — final security check using git diff.
@@ -2220,9 +2390,12 @@ def handle_stop_hook(input_data):
         debug_log(f"Stop hook: already fired {fire_count} times (max {MAX_STOP_HOOK_FIRINGS}), skipping")
         _skip(2)
 
-    if not ENABLE_CODE_SECURITY_REVIEW or not HAS_API_CREDENTIALS:
-        debug_log("Stop hook: LLM review disabled or no API credentials")
-        _skip(3)
+    off = _llm_review_off(session_id)
+    if off:
+        debug_log(f"Stop hook: {off[0]}")
+        # When the sign-in check gave no answer, this turn's changes are kept
+        # for the next Stop review.
+        _skip(3, restore=llm._gateway_check_unanswered, **off[1])
 
     # Stop-hook-only kill switch — placed after consume_stop_state so
     # touched_paths is still cleared each turn (a disabled Stop hook that
@@ -2259,10 +2432,58 @@ def handle_stop_hook(input_data):
             save_repo_hint(session_id, repo_cwd)
         cwd = repo_cwd
 
+    # The baseline belongs to the checkout the prompt hook captured it in.
+    # When the turn ends in another one (the session entered a worktree, or
+    # the edits were in a different repo), it says nothing about what changed
+    # here: this checkout's older commits would look like commits made this
+    # turn, and its files would be diffed against the other checkout's. Use
+    # what this checkout can say for itself instead: its own HEAD when the
+    # turn began (from its reflog) for commits, HEAD for file contents, and
+    # file times for which uncommitted files were already there.
+    origin = None
+    if repo_cwd:
+        try:
+            origin = baseline_origin(repo_cwd, snap_baseline, snap["baseline_root"])
+        except Exception as e:
+            debug_log(f"Stop hook: baseline origin check failed: {e}")
+    foreign_baseline = origin in FOREIGN_ORIGINS
+    since_ns = None
+    if foreign_baseline:
+        at = snap["prompt_at"]
+        at = at if isinstance(at, (int, float)) and 0 < at < 1e11 else None
+        baseline_sha = None
+        head_at_capture = _git_head_at(repo_cwd, at) if at else None
+        untracked_at_baseline = {}
+        since_ns = int(at * 1e9) if at else None
+        debug_log(f"Stop hook: baseline {str(snap_baseline)[:12]} is from another "
+                  f"checkout (origin {origin}); this one was at "
+                  f"{str(head_at_capture)[:12]} when the turn began")
+
     review_paths, diff_base, repo_root, untracked, v2_metrics = compute_v2_review_set(
-        cwd, baseline_sha, head_at_capture, untracked_at_baseline
+        cwd, baseline_sha, head_at_capture, untracked_at_baseline, since_ns=since_ns
     )
+    # Sent even when 0, once git status has worked.
+    if origin is not None and v2_metrics.get("dirty_now_count", -1) >= 0:
+        _TAIL_METRICS["bl_origin"] = baseline_origin_metric(origin, snap["baseline_kept"])
+
     v2_metrics = {**res_metrics, **v2_metrics}
+    # Count-only view of how the review set relates to what the session's
+    # edit tools wrote. Only when a repo was read; never fails the review.
+    def _note_scope(files):
+        try:
+            if "scope" not in _scope:
+                _scope["scope"] = touched_scope(
+                    repo_root, input_data.get("cwd", ""), snap["turn_touched"])
+            # -1: the stored baseline could not be used in this repo.
+            fail = (3 if v2_metrics.get("changed_since_count") == -1
+                    else snap.get("baseline_fail"))
+            _TAIL_METRICS["review_scope"] = review_scope_code(
+                repo_root, *_scope["scope"], files, fail)
+        except Exception as e:
+            debug_log(f"review scope telemetry skipped: {e}")
+    _scope = {}
+    if v2_metrics.get("dirty_now_count", -1) >= 0:
+        _note_scope(review_paths)
     if not review_paths:
         debug_log("Stop hook: empty review set")
         _skip(9, touched_paths_count=len(touched_paths))
@@ -2282,6 +2503,13 @@ def handle_stop_hook(input_data):
         debug_log(f"Stop hook: diff against {content_base[:12]} failed — falling back to {diff_base}")
         diff_output = get_git_diff(repo_root, diff_base, full_context=False,
                                    paths=review_paths, untracked_paths=untracked)
+    # Only when it happened: MiB of git diff output read, reviewable files
+    # whose diff was cut while reading it, diffs that hit the timeout.
+    for _k, _v in (("diff_mb", gitutil._diff_read["bytes"] >> 20),
+                   ("diff_cut_files", gitutil._diff_read["cut_files"]),
+                   ("diff_timeout", gitutil._diff_read["timeouts"])):
+        if _v:
+            _TAIL_METRICS[_k] = _v
     # filter_preexisting_from_diff needs a resolvable pre-turn ref; fall
     # back to HEAD when UPS never captured a baseline (print mode).
     if not baseline_sha:
@@ -2321,8 +2549,13 @@ def handle_stop_hook(input_data):
 
     # Filter out pre-existing content from file rewrites
     diff_files = filter_preexisting_from_diff(diff_files, cwd, baseline_sha)
+    if "scope" in _scope:
+        _note_scope([fp for fp, _ in diff_files])
 
     debug_log(f"Stop hook: reviewing {len(diff_files)} changed files (standard diff)")
+    secret_named = gitutil.count_secret_named(diff_files)
+    if secret_named:
+        _TAIL_METRICS["secret_named_reviewed"] = secret_named
 
     import time as _time
     stop_review_start = _time.time()
@@ -2367,7 +2600,12 @@ def handle_stop_hook(input_data):
         ]
         # Update baseline so next stop hook iteration only sees new changes
         new_sha = None if is_subagent else capture_git_baseline(cwd)
+        new_base_fail = diffstate.last_baseline_fail
         new_untracked_baseline = _list_untracked(cwd) if new_sha else None
+        # After a baseline from another checkout, the rest of it is replaced
+        # too, below.
+        new_head = (_git_rev_parse_head(cwd)
+                    if new_sha and foreign_baseline and not head_at_capture else None)
 
         def _record_fire(state):
             if is_subagent:
@@ -2392,6 +2630,14 @@ def handle_stop_hook(input_data):
             if new_sha:
                 state["baseline_sha"] = new_sha
                 state["untracked_at_baseline"] = new_untracked_baseline
+                _store_baseline_fail(state, new_base_fail)
+                state["baseline_root"] = repo_root
+                state.pop("baseline_kept", None)
+                if foreign_baseline:
+                    # The stored HEAD is the other checkout's. Keep the one
+                    # this review used, so a later Stop this turn still sees
+                    # commits made (or amended) here since the prompt.
+                    state["head_at_capture"] = head_at_capture or new_head
         with_locked_state(session_id, _record_fire)
 
         if new_sha:
@@ -2419,8 +2665,7 @@ def handle_stop_hook(input_data):
             "touched_paths_count": len(touched_paths),
             "review_ms": review_ms,
             "fire_index": fire_index,
-            **({"diff_truncated": llm._last_review_truncated_bytes}
-               if llm._last_review_truncated_bytes else {}),
+            **_stop_diff_truncated(),
             **({"repo_resolution": repo_res} if res_metrics else {}),
             **sweep_trimmed,
             **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
@@ -2457,8 +2702,7 @@ def handle_stop_hook(input_data):
         "review_ms": review_ms,
         "fire_index": fire_index,
         **({"api_error": llm._last_call_claude_http_error} if llm._last_call_claude_http_error is not None else {}),
-        **({"diff_truncated": llm._last_review_truncated_bytes}
-           if llm._last_review_truncated_bytes else {}),
+        **_stop_diff_truncated(),
         **v2_metrics,
         **({"diff_hdr_unparsed": len(gitutil._unparsed_diff_headers)}
            if gitutil._unparsed_diff_headers else {}),
@@ -2483,11 +2727,14 @@ def _maybe_bootstrap_agent_sdk_async():
     is idempotent and O_EXCL-locked, so concurrent/repeat spawns are safe;
     the throttle file only avoids spawning dozens of subprocesses during
     the build window. No-ops in ~10ms on local installs (SDK already
-    importable).
+    importable, or already installed under the state dir, which is not on
+    sys.path here) and when the environment turns the LLM reviews off.
     """
     try:
         import importlib.util
         if importlib.util.find_spec("claude_agent_sdk") is not None:
+            return
+        if llm_reviews_switched_off() or agent_sdk_installed(_resolve_state_dir()):
             return
         import time as _t
         try:
@@ -2621,7 +2868,8 @@ def main():
 
         record_touched_path(session_id, file_path)
 
-        content = extract_content_from_input(tool_name, tool_input)
+        content = extract_content_from_input(
+            tool_name, tool_input, input_data.get("tool_response"))
 
         all_guidance = []
         raw_pattern_matches = []
@@ -2661,30 +2909,31 @@ def main():
         #   rule_id:   RuleId of the first raw match (values stay small/enumerable in telemetry)
         #   rule_mask: bitmask of ALL raw matches — POPCOUNT gives raw hit count,
         #              (mask >> N) & 1 tests for a specific rule
+        output = {}
         if raw_pattern_matches:
             raw_names = [r for r, _ in raw_pattern_matches]
-            output = {"metrics": {
+            output["metrics"] = {
                 "pattern_hits": len(all_guidance),
                 # User-defined patterns (rule_name="user:*") have no static
                 # RuleId; emit -1 so the metrics pipeline can distinguish.
                 "rule_id": int(_RULE_NAME_TO_ID.get(raw_names[0], -1)),
                 "rule_mask": rule_names_to_mask(raw_names),
                 **({"pv": _PV} if _PV else {}),
-            }}
-            if all_guidance:
-                output["hookSpecificOutput"] = {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": PROVENANCE_TAG + "\n\n" + "\n\n".join(all_guidance),
-                }
+            }
+        if all_guidance:
+            output["hookSpecificOutput"] = {
+                "hookEventName": "PostToolUse",
+                "additionalContext": PROVENANCE_TAG + "\n\n" + "\n\n".join(all_guidance),
+            }
+        # The LLM reviews are on but can't run: say so.
+        if (ENABLE_CODE_SECURITY_REVIEW and not HAS_API_CREDENTIALS
+                and (ENABLE_STOP_REVIEW or COMMIT_REVIEW_ENABLED
+                     or PUSH_SWEEP_ENABLED)):
+            notice = _no_credentials_notice(file_path, session_id)
+            if notice:
+                output["systemMessage"] = notice
+        if output:
             _write_hook_output(output)
-        elif all_guidance:
-            # Defensive: pattern rules disabled but guidance somehow set (shouldn't happen)
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": PROVENANCE_TAG + "\n\n" + "\n\n".join(all_guidance),
-                }
-            }))
 
     sys.exit(0)
 
