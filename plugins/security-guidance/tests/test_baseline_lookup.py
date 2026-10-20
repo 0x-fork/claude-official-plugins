@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from conftest import git, make_repo, run_hook, ups_payload
@@ -30,6 +32,22 @@ def repo(tmp_path):
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "add files")
     return repo
+
+
+def _symlink(link, target):
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError):
+        if os.name != "nt":
+            raise
+        pytest.skip("this Windows account cannot create symlinks")
+
+
+@pytest.fixture
+def linked(repo, tmp_path):
+    """The same repo, reached through a symlinked parent directory."""
+    _symlink(tmp_path / "alias", tmp_path / "ws")
+    return tmp_path / "alias" / "mono"
 
 
 @pytest.fixture
@@ -74,10 +92,40 @@ class TestBaselineFileContent:
         for cwd in (repo, repo / "packages" / "app"):
             assert diffstate.get_baseline_file_content("s1", str(twin), str(cwd)) is None
 
+    @pytest.mark.parametrize("session_dir", ["", "packages/app"])
+    def test_found_through_a_symlinked_directory(self, repo, baseline, linked, session_dir):
+        """macOS reaches /tmp and /var through symlinks, so the tool's path and
+        the session directory can spell the same repo differently."""
+        real, alias = repo / session_dir, linked / session_dir
+        for cwd, path in ((real, linked / FILE), (alias, repo / FILE), (alias, linked / FILE)):
+            assert diffstate.get_baseline_file_content("s1", str(path), str(cwd)) == OLD
+
+    def test_session_directory_is_a_symlink_into_the_repo(self, repo, baseline, tmp_path):
+        _symlink(tmp_path / "app", repo / "packages" / "app")
+        for path in (tmp_path / "app" / "main.py", repo / FILE):
+            assert diffstate.get_baseline_file_content(
+                "s1", str(path), str(tmp_path / "app")) == OLD
+
     def test_committed_content_not_the_working_copy(self, repo, baseline):
         (repo / FILE).write_text("print('rewritten')\n")
         assert diffstate.get_baseline_file_content(
             "s1", str(repo / FILE), str(repo / "packages" / "app")) == OLD
+
+
+@pytest.mark.parametrize("session_dir", ["", "packages/app"])
+def test_rewrite_through_a_symlinked_path_does_not_re_flag(repo, linked, hook_env, session_dir):
+    """The session runs in the real directory and the tool names the file
+    through the symlink, as under /tmp on macOS."""
+    cwd = repo / session_dir
+    env = {**hook_env, "CLAUDE_PROJECT_DIR": str(cwd)}
+    run_hook(ups_payload(cwd), env)
+
+    _rc, stdout, _err = run_hook(write_payload(cwd, linked / FILE, OLD + "print('x')\n"), env)
+    assert "additionalContext" not in stdout
+
+    _rc, stdout, _err = run_hook(
+        write_payload(cwd, linked / FILE, OLD + "import pickle\npickle.loads(data)\n"), env)
+    assert "pickle" in stdout and "os.system" not in stdout
 
 
 @pytest.mark.parametrize("session_dir", ["", "packages/app"])
