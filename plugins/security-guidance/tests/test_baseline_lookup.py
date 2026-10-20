@@ -21,7 +21,15 @@ def write_payload(cwd, file_path, content, session_id="s1"):
 
 @pytest.fixture
 def repo(tmp_path):
-    return make_repo(tmp_path / "ws" / "mono", {FILE: OLD, "top.py": OLD})
+    repo = make_repo(tmp_path / "ws" / "mono")
+    # Bytes, so the committed text is OLD on every platform: write_text turns
+    # "\n" into "\r\n" on Windows.
+    for name in (FILE, "top.py"):
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_bytes(OLD.encode())
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "add files")
+    return repo
 
 
 @pytest.fixture
@@ -62,7 +70,7 @@ class TestBaselineFileContent:
         # still not this session's baseline.
         git(repo, "worktree", "add", "-q", str(tmp_path / "ws" / "other"), "-b", "other")
         twin = tmp_path / "ws" / "other" / FILE
-        assert twin.read_text() == OLD
+        assert twin.read_bytes().replace(b"\r\n", b"\n") == OLD.encode()
         for cwd in (repo, repo / "packages" / "app"):
             assert diffstate.get_baseline_file_content("s1", str(twin), str(cwd)) is None
 
