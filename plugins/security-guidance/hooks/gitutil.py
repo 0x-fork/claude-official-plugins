@@ -506,6 +506,41 @@ def _git_toplevel(cwd):
         return None
 
 
+def _git_toplevel_and_head(cwd):
+    """(repo root, HEAD SHA) for `cwd` from one git call, or (None, None)
+    when git cannot give both (not a work tree, no commits)."""
+    try:
+        r = subprocess.run(
+            [*GIT_CMD, "rev-parse", "--show-toplevel", "HEAD"],
+            cwd=cwd, capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None, None
+    if r.returncode != 0:
+        return None, None
+    # See #2099: the first line is a PATH, so decode the bytes manually.
+    top, _, head = r.stdout.decode("utf-8", errors="replace").strip().rpartition("\n")
+    return (top.strip() or None), (head.strip() or None)
+
+
+def _git_head_at(cwd, epoch):
+    """The SHA this checkout's HEAD pointed at just before `epoch` (seconds),
+    read from its own reflog. A checkout created after `epoch` answers with
+    the commit it was created at. None when git cannot say (no reflog)."""
+    try:
+        # Reflog times are whole seconds: ask for the second before, so a
+        # commit made in the same second as `epoch` counts as after it.
+        r = subprocess.run(
+            [*GIT_CMD, "rev-parse", "--verify", "-q", f"HEAD@{{@{int(epoch) - 1}}}"],
+            cwd=cwd, capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
+            TypeError, ValueError, OverflowError):
+        return None
+    sha = r.stdout.decode("utf-8", errors="replace").strip()
+    return sha if r.returncode == 0 and sha else None
+
+
 def _git_dir(repo_root):
     """Absolute shared `.git` directory for repo_root.
 
