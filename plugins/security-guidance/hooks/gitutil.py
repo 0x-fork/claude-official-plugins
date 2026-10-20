@@ -1259,6 +1259,42 @@ def _is_secret_shaped(file_path):
     return False
 
 
+# Data files whose name says they hold secrets (`secrets.yml`,
+# `client_secret.json`). They are reviewed like any other data file; the Stop
+# hook only counts how many are in its review set (never the names), to show
+# how common they are.
+_SECRET_NAMED_STEMS = frozenset((
+    'secret', 'secrets', 'credential', 'credentials',
+    'client_secret', 'client_secrets', 'client-secret', 'client-secrets',
+    'service-account', 'service_account', 'serviceaccount',
+    'service-account-key', 'service_account_key', 'serviceaccountkey',
+))
+_SECRET_NAMED_DATA_EXTENSIONS = frozenset((
+    '.json', '.yaml', '.yml', '.toml', '.properties', '.tfvars',
+))
+# `secrets.example.yml` is a placeholder and `secrets.enc.yaml` is ciphertext.
+_NOT_SECRET_NAME_PARTS = frozenset((
+    'example', 'sample', 'template', 'tmpl', 'dist', 'schema',
+    'enc', 'encrypted', 'sops',
+))
+
+
+def _is_secret_named(file_path):
+    base = os.path.basename(file_path.replace("\\", "/")).lower()
+    parts = base.lstrip('.').split('.')
+    if len(parts) < 2 or '.' + parts[-1] not in _SECRET_NAMED_DATA_EXTENSIONS:
+        return False
+    if _NOT_SECRET_NAME_PARTS.intersection(parts[1:-1]):
+        return False
+    stem = parts[0]
+    # Google's OAuth download is `client_secret_<client id>.json`.
+    return stem in _SECRET_NAMED_STEMS or stem.startswith('client_secret_')
+
+
+def count_secret_named(diff_files):
+    return sum(1 for file_path, _ in diff_files if _is_secret_named(file_path))
+
+
 # Path tokens that bump a file's review priority when a commit exceeds
 # MAX_DIFF_FILES and we have to pick a subset. These are exactly the surfaces
 # single-shot and agentic reviews disagree on most (auth, routing, IPC,
