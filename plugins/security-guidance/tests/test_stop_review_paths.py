@@ -57,18 +57,19 @@ long_paths = pytest.mark.skipif(
 
 
 def _refuse_long_commands(monkeypatch, limit, error):
-    """Make subprocess.run fail like the OS does for a command whose
-    arguments exceed `limit` characters. Returns the list of commands run."""
-    real_run = subprocess.run
+    """Make starting a command fail like the OS does when its arguments
+    exceed `limit` characters. Returns the list of commands run. Popen is
+    where subprocess.run and the bounded diff reader both start theirs."""
+    real_popen = subprocess.Popen
     ran = []
 
-    def run(cmd, *args, **kwargs):
+    def popen(cmd, *args, **kwargs):
         if sum(len(a) + 1 for a in cmd) > limit:
             raise error
         ran.append(cmd)
-        return real_run(cmd, *args, **kwargs)
+        return real_popen(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     return ran
 
 
@@ -126,6 +127,8 @@ class TestGetGitDiff:
         assert sorted(gitutil.parse_diff_into_files(batched)) == \
             sorted(gitutil.parse_diff_into_files(whole))
         assert len([c for c in ran if "diff" in c]) > 1
+        # The batches are read through the bounded reader, which counts them.
+        assert gitutil._diff_read["bytes"] > 0
 
     def test_only_reviewable_paths_after_a_refusal(self, tmp_path, git_env, monkeypatch):
         repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
