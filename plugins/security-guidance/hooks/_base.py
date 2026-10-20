@@ -34,11 +34,12 @@ def state_dir():
     """
     explicit = os.environ.get("SECURITY_WARNINGS_STATE_DIR")
     if explicit:
-        return os.path.expanduser(explicit)
-    cc_config = os.environ.get("CLAUDE_CONFIG_DIR")
-    if cc_config:
-        return os.path.expanduser(os.path.join(cc_config, "security"))
-    return os.path.expanduser("~/.claude/security")
+        d = explicit
+    elif os.environ.get("CLAUDE_CONFIG_DIR"):
+        d = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "security")
+    else:
+        d = "~/.claude/security"
+    return os.path.abspath(os.path.expanduser(d))
 
 
 def llm_reviews_switched_off():

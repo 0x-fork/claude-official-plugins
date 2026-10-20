@@ -48,11 +48,27 @@ GIT_CMD = [
     "-c", "diff.noprefix=false",
     "-c", "diff.srcPrefix=a/",
     "-c", "diff.dstPrefix=b/",
+    # A directory with its own `.git` inside the work tree (a submodule, a
+    # vendored checkout, an unpacked archive) is another repository with its
+    # own config. To report it as modified, or to show its changes inline
+    # (diff.submodule=diff), git starts a second git inside it, which reads
+    # that config and runs the commands it names. The hook stays out of it:
+    # such a directory is left out of the review set, and a commit that moves
+    # one shows as the two commit ids.
+    "-c", "diff.ignoreSubmodules=all",
+    "-c", "diff.submodule=short",
 ]
+
+# diff.ignoreSubmodules is a default that the repository's own settings for
+# one submodule (.gitmodules, submodule.<name>.ignore) override. The option
+# cannot be overridden. Pass it to every `git status` and work-tree `git diff`.
+IGNORE_SUBMODULES = "--ignore-submodules=all"
 
 SAFE_GIT_CONFIG = (
     ("core.fsmonitor", "false"),
     ("core.hooksPath", "/dev/null"),
+    ("diff.ignoreSubmodules", "all"),
+    ("diff.submodule", "short"),
 )
 
 # The hook's git runs in the background beside the session's own git. Without
@@ -448,8 +464,11 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
             # `git status` and here would silently drop ALL untracked files
             # from the diff. --ignore-missing only works with --dry-run, so
             # filter to surviving paths (lexists so dangling symlinks count).
+            # A nested repository (`dir/`) would be added as a submodule
+            # entry; see diff.ignoreSubmodules in GIT_CMD.
             surviving = [p for p in untracked_paths
-                         if os.path.lexists(os.path.join(cwd, p))]
+                         if not p.endswith("/")
+                         and os.path.lexists(os.path.join(cwd, p))]
             add_args = ["--"] + surviving if surviving else None
         else:
             add_args = None
@@ -485,6 +504,41 @@ def _git_toplevel(cwd):
         return path if path else None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
+
+
+def _git_toplevel_and_head(cwd):
+    """(repo root, HEAD SHA) for `cwd` from one git call, or (None, None)
+    when git cannot give both (not a work tree, no commits)."""
+    try:
+        r = subprocess.run(
+            [*GIT_CMD, "rev-parse", "--show-toplevel", "HEAD"],
+            cwd=cwd, capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None, None
+    if r.returncode != 0:
+        return None, None
+    # See #2099: the first line is a PATH, so decode the bytes manually.
+    top, _, head = r.stdout.decode("utf-8", errors="replace").strip().rpartition("\n")
+    return (top.strip() or None), (head.strip() or None)
+
+
+def _git_head_at(cwd, epoch):
+    """The SHA this checkout's HEAD pointed at just before `epoch` (seconds),
+    read from its own reflog. A checkout created after `epoch` answers with
+    the commit it was created at. None when git cannot say (no reflog)."""
+    try:
+        # Reflog times are whole seconds: ask for the second before, so a
+        # commit made in the same second as `epoch` counts as after it.
+        r = subprocess.run(
+            [*GIT_CMD, "rev-parse", "--verify", "-q", f"HEAD@{{@{int(epoch) - 1}}}"],
+            cwd=cwd, capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
+            TypeError, ValueError, OverflowError):
+        return None
+    sha = r.stdout.decode("utf-8", errors="replace").strip()
+    return sha if r.returncode == 0 and sha else None
 
 
 def _git_dir(repo_root):
@@ -673,7 +727,7 @@ def _git_name_only(cwd, base, include_untracked=False):
     def _run(env):
         # core.quotePath=false comes from GIT_CMD globally (see definition).
         result = subprocess.run(
-            [*GIT_CMD, "diff", "--name-only", "-z", base],
+            [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--name-only", "-z", base],
             cwd=cwd, capture_output=True, timeout=30,
             env=env,
         )
@@ -714,7 +768,7 @@ def _git_status_porcelain(cwd):
     try:
         # core.quotePath=false comes from GIT_CMD globally (see definition).
         r = subprocess.run(
-            [*GIT_CMD, "status", "--porcelain=v1", "-uall", "-z"],
+            [*GIT_CMD, "status", IGNORE_SUBMODULES, "--porcelain=v1", "-uall", "-z"],
             cwd=cwd, capture_output=True, timeout=30,
         )
         if r.returncode != 0:
@@ -732,7 +786,10 @@ def _git_status_porcelain(cwd):
                 continue
             xy, path = e[:2], e[3:]
             if xy == "??":
-                untracked.add(path)
+                # With -uall only a nested repository is listed as `dir/`.
+                # It is not a file to review; see diff.ignoreSubmodules.
+                if not path.endswith("/"):
+                    untracked.add(path)
             else:
                 tracked.add(path)
                 # Rename/copy entries are XY old\0new\0 — second NUL field is
@@ -791,7 +848,7 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
         return ""
 
     # core.quotePath=false comes from GIT_CMD globally (see definition).
-    cmd = [*GIT_CMD, "diff", "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else []) + pathspec
+    cmd = [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else []) + pathspec
     try:
         if untracked_paths is not None and not untracked_paths:
             # Nothing to `add -N`, and the diff only reads the index.
@@ -874,9 +931,12 @@ _SSH_PRIVATE_KEY_BASENAMES = frozenset((
     'id_ed25519_sk', 'id_xmss',
 ))
 _PRIVATE_KEY_NAME_SUFFIXES = ('_rsa', '_dsa', '_ecdsa', '_ed25519')
+# `.credentials.json` and `.claude.json` are Claude Code's own files: sign-in
+# tokens, a saved API key, MCP server secrets. Claude Code rewrites them as it
+# runs, so they show up as changed when its config directory is a git repo.
 _CREDENTIAL_BASENAMES = frozenset((
     'credentials', '.netrc', '.pgpass', '.npmrc', '.pypirc',
-    '.git-credentials', '.dockercfg',
+    '.git-credentials', '.dockercfg', '.credentials.json', '.claude.json',
 ))
 # chezmoi encodes a target file's attributes as stacked name prefixes
 # (`private_dot_netrc`, `encrypted_private_token`); `dot_` stands for a

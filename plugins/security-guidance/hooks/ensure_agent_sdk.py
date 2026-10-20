@@ -30,6 +30,24 @@ from pathlib import Path
 from _base import portable_output, state_dir as _resolve_state_dir, write_hook_output
 from _base import llm_reviews_switched_off
 
+
+def _spawn_cwd() -> str:
+    """Working directory for every Python this file starts.
+
+    `python -c` and `python -m` put the working directory first on the import
+    path, and hooks run in the user's repository, so a repository file named
+    `claude_agent_sdk.py`, `venv.py` or `pip.py` would be imported in place
+    of the real module. The state dir is the plugin's own (the venv is built
+    there, so the interpreter can reach it); the plugin folder is the
+    fallback when it can't be created.
+    """
+    d = _resolve_state_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        return str(Path(__file__).resolve().parent.parent)
+
 # Outcome codes for the sdk_bootstrap metric. Values are stable for telemetry.
 NOOP_SYSTEM = 0      # claude_agent_sdk already importable in system python
 NOOP_VENV = 1        # venv already built and SDK imports from it
@@ -315,7 +333,7 @@ def _probe_has_pip() -> bool:
     try:
         r = subprocess.run(
             [sys.executable, "-m", "pip", "--version"],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, cwd=_spawn_cwd(),
         )
         return r.returncode == 0
     except Exception:
@@ -427,7 +445,7 @@ def _target_sdk_importable(state_dir) -> bool:
             [sys.executable, "-c",
              "import sys; sys.path.insert(0, sys.argv[1]); " + _SDK_IMPORT_PROBE,
              str(target)],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, cwd=_spawn_cwd(),
         )
         return r.returncode == 0
     except Exception:
@@ -452,7 +470,7 @@ def _build_via_target(state_dir) -> tuple[int, str, str]:
              "--target", str(target), "--upgrade",
              "--disable-pip-version-check", "--prefer-binary", "--no-cache-dir",
              "claude-agent-sdk"],
-            capture_output=True, timeout=120, check=True,
+            capture_output=True, timeout=120, check=True, cwd=_spawn_cwd(),
         )
         return BUILT_TARGET, "", ""
     except subprocess.CalledProcessError as e:
@@ -634,7 +652,7 @@ def main() -> tuple[int, str, str]:
         try:
             r = subprocess.run(
                 [str(venv_py), "-c", _SDK_IMPORT_PROBE],
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=10, cwd=_spawn_cwd(),
             )
             if r.returncode == 0:
                 return NOOP_VENV, "", ""
@@ -671,7 +689,7 @@ def main() -> tuple[int, str, str]:
         err_phase = "venv"
         subprocess.run(
             [sys.executable, "-m", "venv", "--clear", str(venv)],
-            capture_output=True, timeout=60, check=True,
+            capture_output=True, timeout=60, check=True, cwd=_spawn_cwd(),
         )
         # Some machines route pip through a private registry; we
         # don't pass --index-url here so we inherit that default. Outside
@@ -695,7 +713,7 @@ def main() -> tuple[int, str, str]:
             [str(venv_py), "-m", "pip", "install", "--quiet",
              "--disable-pip-version-check", "--prefer-binary", "--no-cache-dir",
              "claude-agent-sdk"],
-            capture_output=True, timeout=120, check=True,
+            capture_output=True, timeout=120, check=True, cwd=_spawn_cwd(),
         )
         return BUILT, "", ""
     except subprocess.CalledProcessError as e:
