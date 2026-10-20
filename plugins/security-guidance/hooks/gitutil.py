@@ -51,11 +51,27 @@ GIT_CMD = [
     "-c", "diff.noprefix=false",
     "-c", "diff.srcPrefix=a/",
     "-c", "diff.dstPrefix=b/",
+    # A directory with its own `.git` inside the work tree (a submodule, a
+    # vendored checkout, an unpacked archive) is another repository with its
+    # own config. To report it as modified, or to show its changes inline
+    # (diff.submodule=diff), git starts a second git inside it, which reads
+    # that config and runs the commands it names. The hook stays out of it:
+    # such a directory is left out of the review set, and a commit that moves
+    # one shows as the two commit ids.
+    "-c", "diff.ignoreSubmodules=all",
+    "-c", "diff.submodule=short",
 ]
+
+# diff.ignoreSubmodules is a default that the repository's own settings for
+# one submodule (.gitmodules, submodule.<name>.ignore) override. The option
+# cannot be overridden. Pass it to every `git status` and work-tree `git diff`.
+IGNORE_SUBMODULES = "--ignore-submodules=all"
 
 SAFE_GIT_CONFIG = (
     ("core.fsmonitor", "false"),
     ("core.hooksPath", "/dev/null"),
+    ("diff.ignoreSubmodules", "all"),
+    ("diff.submodule", "short"),
 )
 
 # The hook's git runs in the background beside the session's own git. Without
@@ -451,8 +467,11 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
             # `git status` and here would silently drop ALL untracked files
             # from the diff. --ignore-missing only works with --dry-run, so
             # filter to surviving paths (lexists so dangling symlinks count).
+            # A nested repository (`dir/`) would be added as a submodule
+            # entry; see diff.ignoreSubmodules in GIT_CMD.
             surviving = [p for p in untracked_paths
-                         if os.path.lexists(os.path.join(cwd, p))]
+                         if not p.endswith("/")
+                         and os.path.lexists(os.path.join(cwd, p))]
             add_args = ["--"] + surviving if surviving else None
         else:
             add_args = None
@@ -676,7 +695,7 @@ def _git_name_only(cwd, base, include_untracked=False):
     def _run(env):
         # core.quotePath=false comes from GIT_CMD globally (see definition).
         result = subprocess.run(
-            [*GIT_CMD, "diff", "--name-only", "-z", base],
+            [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--name-only", "-z", base],
             cwd=cwd, capture_output=True, timeout=30,
             env=env,
         )
@@ -717,7 +736,7 @@ def _git_status_porcelain(cwd):
     try:
         # core.quotePath=false comes from GIT_CMD globally (see definition).
         r = subprocess.run(
-            [*GIT_CMD, "status", "--porcelain=v1", "-uall", "-z"],
+            [*GIT_CMD, "status", IGNORE_SUBMODULES, "--porcelain=v1", "-uall", "-z"],
             cwd=cwd, capture_output=True, timeout=30,
         )
         if r.returncode != 0:
@@ -735,7 +754,10 @@ def _git_status_porcelain(cwd):
                 continue
             xy, path = e[:2], e[3:]
             if xy == "??":
-                untracked.add(path)
+                # With -uall only a nested repository is listed as `dir/`.
+                # It is not a file to review; see diff.ignoreSubmodules.
+                if not path.endswith("/"):
+                    untracked.add(path)
             else:
                 tracked.add(path)
                 # Rename/copy entries are XY old\0new\0 — second NUL field is
@@ -1055,7 +1077,7 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
         return ""
 
     # core.quotePath=false comes from GIT_CMD globally (see definition).
-    cmd = [*GIT_CMD, "diff", "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else []) + pathspec
+    cmd = [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else []) + pathspec
     _diff_read.update(bytes=0, cut_files=0, cut_bytes=0)
     try:
         if untracked_paths is not None and not untracked_paths:
