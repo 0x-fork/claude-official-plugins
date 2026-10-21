@@ -120,23 +120,25 @@ def pki(tmp_path_factory):
             "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
     (d / "leaf.cnf").write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\n" + leaf)
     (d / "other-host.cnf").write_text("subjectAltName=DNS:other.invalid\n" + leaf)
-    (d / "ca.cnf").write_text(
-        "[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n"
-        "[dn]\nCN=placeholder\n"
-        "[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
-        "subjectKeyIdentifier=hash\n")
+    # The subject goes in the config file: LibreSSL ignores -subj when the config has prompt=no.
+    def req_config(common_name):
+        (d / "req.cnf").write_text(
+            "[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n"
+            f"[dn]\nCN={common_name}\n"
+            "[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
+            "subjectKeyIdentifier=hash\n")
     out = {}
     # server certificate -> (the CA that signs it, its extensions)
     servers = {"trusted": ("trusted", "leaf.cnf"), "untrusted": ("untrusted", "leaf.cnf"),
                "other-host": ("trusted", "other-host.cnf")}
     for ca in ("trusted", "untrusted"):
-        _openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-config", "ca.cnf",
-                 "-keyout", f"{ca}-ca.key", "-out", f"{ca}-ca.pem", "-days", "2",
-                 "-subj", f"/CN=sg test {ca} CA", cwd=d)
+        req_config(f"sg test {ca} CA")
+        _openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-config", "req.cnf",
+                 "-keyout", f"{ca}-ca.key", "-out", f"{ca}-ca.pem", "-days", "2", cwd=d)
+    req_config("sg test server")
     for name, (ca, extensions) in servers.items():
-        _openssl("req", "-newkey", "rsa:2048", "-nodes", "-config", "ca.cnf",
-                 "-keyout", f"{name}.key", "-out", f"{name}.csr",
-                 "-subj", "/CN=sg test server", cwd=d)
+        _openssl("req", "-newkey", "rsa:2048", "-nodes", "-config", "req.cnf",
+                 "-keyout", f"{name}.key", "-out", f"{name}.csr", cwd=d)
         _openssl("x509", "-req", "-in", f"{name}.csr", "-CA", f"{ca}-ca.pem",
                  "-CAkey", f"{ca}-ca.key", "-CAcreateserial", "-out", f"{name}.pem",
                  "-days", "2", "-extfile", extensions, cwd=d)
