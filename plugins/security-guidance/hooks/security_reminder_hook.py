@@ -309,6 +309,10 @@ def emit_metrics(
     # Diagnostic keys go last, so they are the first dropped when a row is
     # over CC's key cap and never displace an existing key.
     tail = {}
+    if llm._store_certs_skipped:
+        # The Windows certificate store held entries OpenSSL cannot read and
+        # the plugin's API calls ran on the store without them.
+        tail["tls_store_skipped"] = llm._store_certs_skipped
     if usage or "review_ms" in metrics or metrics.get("review_failed"):
         # Review rows say whether the plugin's calls went through a gateway,
         # so the error rate behind gateways can be read per plugin version.
