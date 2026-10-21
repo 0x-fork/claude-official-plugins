@@ -321,8 +321,8 @@ def test_untracked_file_name_is_not_read_as_a_pattern(outer, git_env):
 def test_gitlink_without_a_repository_stays_in_the_copy(outer, marker, git_env):
     """A submodule that is not checked out: an empty directory."""
     nested = _record_nested_repo(outer, marker)
-    import shutil
-    shutil.rmtree(nested)
+    # Moved, not deleted: git's object files are read-only on Windows.
+    nested.rename(outer.parent / "moved-away")
     nested.mkdir()
     (outer / "app.py").write_text(VULN_PY)
 
