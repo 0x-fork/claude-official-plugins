@@ -287,16 +287,31 @@ def get_baseline_file_content(session_id, file_path, cwd):
     try:
         abs_path = os.path.abspath(file_path)
         cwd_abs = os.path.abspath(cwd) if cwd else os.getcwd()
-        try:
-            rel_path = os.path.relpath(abs_path, cwd_abs)
-        except ValueError:
-            return None
-        result = subprocess.run(
-            [*GIT_CMD, "show", f"{baseline_sha}:{rel_path}"],
-            cwd=cwd, capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            return (result.stdout or b"").decode("utf-8", errors="replace")
+        attempts = [(abs_path, cwd_abs, cwd)]
+        # The tool's path and the session directory can name the same place
+        # through different symlinks (/tmp and /var on macOS). The relative
+        # path between the two spellings then leaves the repo and git finds
+        # nothing, so the lookup is tried again with both resolved.
+        real_path, real_cwd = os.path.realpath(abs_path), os.path.realpath(cwd_abs)
+        if (real_path, real_cwd) != (abs_path, cwd_abs):
+            attempts.append((real_path, real_cwd, real_cwd))
+        for path, start, git_cwd in attempts:
+            try:
+                rel_path = os.path.relpath(path, start)
+            except ValueError:
+                continue
+            # `<rev>:<path>` is read from the repo root unless the path starts
+            # with `./`, and takes forward slashes only. Without both, the
+            # lookup fails for a session started below the repo root, and on
+            # Windows for any file that is not directly in the session
+            # directory.
+            rel_path = rel_path.replace(os.sep, "/")
+            result = subprocess.run(
+                [*GIT_CMD, "show", f"{baseline_sha}:./{rel_path}"],
+                cwd=git_cwd, capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                return (result.stdout or b"").decode("utf-8", errors="replace")
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
         return None
@@ -352,7 +367,8 @@ def capture_git_baseline(cwd):
         sha = ""
         # untracked_paths=[]: a plain copy of the index, no `add -N` pass.
         with _temp_index(cwd, untracked_paths=[]) as env:
-            # env is None when there is no index file to copy: treat as clean.
+            # env is None when no usable index copy could be made: fall
+            # back to HEAD.
             if env is not None:
                 result = subprocess.run(
                     [*GIT_CMD, "stash", "create"],

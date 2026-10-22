@@ -86,7 +86,7 @@ from _base import (  # noqa: E402,F401
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
     _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
     _USAGE_CONTEXT, _log_usage,
-    state_dir as _resolve_state_dir,
+    launcher_probe_metrics, state_dir as _resolve_state_dir,
     write_hook_output as _write_hook_output,
     llm_reviews_switched_off, agent_sdk_installed,
 )
@@ -202,6 +202,13 @@ MAX_STOP_HOOK_FIRINGS = int(os.environ.get("MAX_STOP_HOOK_FIRINGS", "3"))
 # diff; unbounded diffs burn tokens and risk 400 on context length.
 MAX_DIFF_FILES = int(os.environ.get("MAX_DIFF_FILES", "30"))
 
+# Changed source paths past which the Stop review is skipped before any diff.
+# A set this large is a repo at $HOME or an unignored cache, not edits; no
+# platform takes that many paths in one git command, and only resolving them
+# takes seconds. Paths the review never reads (an unignored node_modules) do
+# not count: they must not hide the one edited source file beside them.
+MAX_REVIEW_SET_PATHS = int(os.environ.get("MAX_REVIEW_SET_PATHS", "100000"))
+
 # Appended to all exit(2) guidance so the asyncRewake auto-turn doesn't
 # cause the model to abandon the user's original request.
 CONTINUATION_SUFFIX = (
@@ -213,9 +220,13 @@ CONTINUATION_SUFFIX = (
 
 # Extra keys emit_metrics appends to every row this invocation emits.
 _TAIL_METRICS: Dict[str, Any] = {}
-# Of those, the ones that go after all others: the first a row over CC's key
-# cap loses, whenever they were set.
+# Of those, the ones that go after the others whenever they were set: a row
+# over CC's key cap loses them before any older review key. Only the launcher
+# keys below come later; those are also on every smaller row of the session.
 _LAST_METRIC_KEYS = ("diff_seen",)
+
+# The launcher's slow interpreter probes, if any. After everything else.
+_LAUNCHER_METRICS: Dict[str, Any] = launcher_probe_metrics()
 
 # Reviewer context diagnostics from llm.agentic_review, most useful first.
 _REVIEWER_CONTEXT_KEYS = ("rv_cwd_gone", "rv_tool_err", "rv_tool_calls")
@@ -303,6 +314,10 @@ def emit_metrics(
     # Diagnostic keys go last, so they are the first dropped when a row is
     # over CC's key cap and never displace an existing key.
     tail = {}
+    if llm._store_certs_skipped:
+        # The Windows certificate store held entries OpenSSL cannot read and
+        # the plugin's API calls ran on the store without them.
+        tail["tls_store_skipped"] = llm._store_certs_skipped
     if usage or "review_ms" in metrics or metrics.get("review_failed"):
         # Review rows say whether the plugin's calls went through a gateway,
         # so the error rate behind gateways can be read per plugin version.
@@ -317,6 +332,7 @@ def emit_metrics(
     for k in _LAST_METRIC_KEYS:
         if k in tail:
             tail[k] = tail.pop(k)
+    tail.update(_LAUNCHER_METRICS)
     metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}
     if rewake_summary:
@@ -515,7 +531,10 @@ def record_pending_warnings(session_id, file_path, rule_names):
 def sweep_pending_warnings(session_id):
     """
     Stop-hook final sweep. Re-read every file in pending_warnings, re-check
-    patterns, and return (fixed, unresolved, unresolved_mask). Clears state.
+    patterns, and return (fixed, unresolved, unresolved_mask, fired_mask).
+    fired_mask has a bit for every built-in rule that matched an edit since
+    the last sweep (whether or not its reminder was shown again), so the two
+    masks give, per rule, fired and still matching. Clears state.
     A file that's been deleted counts as fixed — the dangerous code is gone.
     Never raises — this is telemetry and must not break the Stop hook.
     """
@@ -523,18 +542,24 @@ def sweep_pending_warnings(session_id):
         try:
             pending = state.get("pending_warnings")
             if not isinstance(pending, dict) or not pending:
-                return 0, 0, 0
+                return 0, 0, 0, 0
 
             by_file = {}
             for key in pending:
                 if not isinstance(key, str) or ":" not in key:
                     continue
                 fp, _, rule = key.rpartition(":")
+                if fp.endswith(":user"):
+                    # User rules are named "user:<name>"; keep them apart
+                    # from a built-in rule of the same name.
+                    fp, rule = fp[:-len(":user")], "user:" + rule
                 by_file.setdefault(fp, set()).add(rule)
 
             unresolved = []
+            fired = set()
             fixed = 0
             for fp, rules in by_file.items():
+                fired |= rules
                 try:
                     with open(fp, "r", errors="replace") as f:
                         still_matching = {r for r, _ in check_patterns(fp, f.read())}
@@ -550,13 +575,14 @@ def sweep_pending_warnings(session_id):
             # Filter to known rules so a renamed/removed rule in old state
             # doesn't KeyError rule_names_to_mask.
             known = [r for r in unresolved if r in _RULE_NAME_TO_ID]
-            return fixed, len(unresolved), rule_names_to_mask(known)
+            return (fixed, len(unresolved), rule_names_to_mask(known),
+                    rule_names_to_mask(fired))
         except Exception as e:
             debug_log(f"sweep_pending_warnings failed: {e}")
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
     result = with_locked_state(session_id, _sweep)
-    return result if result is not None else (0, 0, 0)
+    return result if result is not None else (0, 0, 0, 0)
 
 # =====================================================================
 # Git baseline management
@@ -2372,13 +2398,25 @@ def handle_stop_hook(input_data):
     # Sweep pattern-warning outcomes (pure local work; stop_hook_active is
     # already guaranteed False here so no double-count guard needed).
     sweep = {}
-    warn_fixed, warn_unresolved, warn_unresolved_mask = sweep_pending_warnings(session_id)
+    (warn_fixed, warn_unresolved, warn_unresolved_mask,
+     warn_fired_mask) = sweep_pending_warnings(session_id)
     if warn_fixed or warn_unresolved:
         sweep = {
             "warn_fixed": warn_fixed,
             "warn_unresolved": warn_unresolved,
             "warn_unresolved_mask": warn_unresolved_mask,
         }
+    # The two masks also ride the tail, so the reviewed rows below, which
+    # leave `sweep` or its mask out, carry them when there is room under the
+    # key cap. Per rule they give how often it fired and how often the
+    # flagged code was still there at Stop. warn_fired_mask goes after
+    # warn_unresolved_mask: a row cut at the cap loses it first, and a row
+    # without it is left out of the per-rule read instead of counting its
+    # rules as fixed.
+    if warn_unresolved_mask:
+        _TAIL_METRICS["warn_unresolved_mask"] = warn_unresolved_mask
+    if warn_fired_mask:
+        _TAIL_METRICS["warn_fired_mask"] = warn_fired_mask
 
     v2_metrics = {}
 
@@ -2504,6 +2542,12 @@ def handle_stop_hook(input_data):
         debug_log("Stop hook: empty review set")
         _skip(9, touched_paths_count=len(touched_paths))
     debug_log(f"Stop hook: review_set={len(review_paths)} base={diff_base[:12]} dirty_now={v2_metrics['dirty_now_count']} changed_since={v2_metrics['changed_since_count']}")
+    if (len(review_paths) > MAX_REVIEW_SET_PATHS
+            and sum(_is_reviewable_source(os.path.relpath(p, repo_root))
+                    for p in review_paths) > MAX_REVIEW_SET_PATHS):
+        debug_log(f"Stop hook: pathological review set (more than "
+                  f"{MAX_REVIEW_SET_PATHS} paths), skipping")
+        _skip(8)
     # Run from repo_root so the toplevel-relative review_paths resolve.
     # Diff CONTENT against the turn-start stash (baseline_sha) so the LLM
     # sees only this-turn edits — diffing against HEAD includes the user's
@@ -2515,7 +2559,8 @@ def handle_stop_hook(input_data):
     content_base = baseline_sha or diff_base
     diff_output = get_git_diff(repo_root, content_base, full_context=False,
                                paths=review_paths, untracked_paths=untracked)
-    if diff_output is None and content_base != diff_base:
+    if (diff_output is None and content_base != diff_base
+            and "gave_up" not in gitutil._path_list_too_long):
         debug_log(f"Stop hook: diff against {content_base[:12]} failed — falling back to {diff_base}")
         diff_output = get_git_diff(repo_root, diff_base, full_context=False,
                                    paths=review_paths, untracked_paths=untracked)
@@ -2532,6 +2577,12 @@ def handle_stop_hook(input_data):
         baseline_sha = "HEAD"
 
     if not diff_output or not diff_output.strip():
+        if "gave_up" in gitutil._path_list_too_long:
+            debug_log("Stop hook: changed paths do not fit the git commands, skipping")
+            _skip(8)
+        if "none_reviewable" in gitutil._path_list_too_long:
+            debug_log("Stop hook: no source code files among the changed paths")
+            _skip(7)
         debug_log("Stop hook: no changes since baseline")
         _skip(6)
 
@@ -2935,6 +2986,7 @@ def main():
                 "rule_id": int(_RULE_NAME_TO_ID.get(raw_names[0], -1)),
                 "rule_mask": rule_names_to_mask(raw_names),
                 **({"pv": _PV} if _PV else {}),
+                **_LAUNCHER_METRICS,
             }
         if all_guidance:
             output["hookSpecificOutput"] = {

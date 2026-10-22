@@ -15,9 +15,11 @@ Functions that DO compose patched leaves (``compute_v2_review_set``,
 ``security_reminder_hook.py`` for that reason.
 """
 import contextlib
+import errno
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -55,9 +57,9 @@ GIT_CMD = [
     # vendored checkout, an unpacked archive) is another repository with its
     # own config. To report it as modified, or to show its changes inline
     # (diff.submodule=diff), git starts a second git inside it, which reads
-    # that config and runs the commands it names. The hook stays out of it:
-    # such a directory is left out of the review set, and a commit that moves
-    # one shows as the two commit ids.
+    # that config and runs the commands it names. Such a directory is left
+    # out of the review set, and so is a commit that moves one. See also
+    # _drop_gitlinks for the commands that take no such setting.
     "-c", "diff.ignoreSubmodules=all",
     "-c", "diff.submodule=short",
 ]
@@ -148,6 +150,35 @@ def _find_git_index(cwd):
         return None
 
 
+def _find_git_index_and_top(cwd):
+    """_find_git_index plus the work tree's top directory, from one git
+    call. (None, None) when either is missing: no index file, a bare
+    repository, or a `cwd` inside the git directory."""
+    try:
+        result = subprocess.run(
+            [*GIT_CMD, "rev-parse", "--git-dir", "--show-toplevel"],
+            cwd=cwd, capture_output=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None, None
+        # Paths as bytes from git: decode by hand (see _find_git_index).
+        out = result.stdout.decode("utf-8", errors="replace")
+        parts = out[:-1].split("\n") if out.endswith("\n") else []
+        if len(parts) != 2 or not all(parts):
+            # A newline in one of the paths: ask for them one at a time.
+            index_path, top = _find_git_index(cwd), _git_toplevel(cwd)
+            return (index_path, top) if index_path and top else (None, None)
+        git_dir, top = parts
+        if not os.path.isabs(git_dir):
+            git_dir = os.path.join(cwd, git_dir)
+        index_path = os.path.join(git_dir, "index")
+        if not os.path.isfile(index_path):
+            return None, None
+        return index_path, top
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None, None
+
+
 def _diff_pathspec(cwd, paths):
     """Convert absolute touched-paths to repo-relative pathspec args for
     git diff. Paths outside cwd (e.g. ~/.claude/…) are dropped. Returns the
@@ -167,6 +198,119 @@ def _diff_pathspec(cwd, paths):
             continue
         rel.append(r)
     return ["--"] + rel if rel else []
+
+
+# Bytes of file paths per git call once a path list has proved too long for
+# one command. Windows caps a whole command line at 32,767 characters;
+# elsewhere the limit is about 1 MB (macOS) or 2 MB (Linux), environment
+# included.
+_MAX_PATH_ARGS_BYTES = (
+    20000 if sys.platform in ("win32", "cygwin", "msys") else 500000)
+# More commands than this and the path list is not worth diffing: each one
+# matches its paths against the whole index, and a set that large is thrown
+# away as pathological after the diff anyway.
+_MAX_PATH_BATCHES = 4
+
+
+def _arg_cost(path):
+    # The exec limit also counts a terminator and a pointer per argument.
+    return len(os.fsencode(path)) + 9
+
+
+def _path_args_budget(env=None):
+    """_MAX_PATH_ARGS_BYTES, or less where this system's own limit is lower
+    (a small stack limit, a BSD, a very large environment). Half of what the
+    system leaves after the environment, so the rest of the command fits."""
+    try:
+        arg_max = os.sysconf("SC_ARG_MAX")
+    except (AttributeError, ValueError, OSError):
+        return _MAX_PATH_ARGS_BYTES
+    env_bytes = sum(len(k) + len(v) + 2 for k, v in (env or os.environ).items())
+    return min(_MAX_PATH_ARGS_BYTES, max(4096, (arg_max - env_bytes) // 2))
+
+
+def _path_batches(paths, budget=None):
+    if budget is None:
+        budget = _MAX_PATH_ARGS_BYTES
+    batch, size = [], 0
+    for p in paths:
+        n = _arg_cost(p)
+        if batch and size + n > budget:
+            yield batch
+            batch, size = [], 0
+        batch.append(p)
+        size += n
+    if batch:
+        yield batch
+
+
+# Why a path list too long for one command left the last get_git_diff call
+# without a diff, for the Stop review's skip reason: "gave_up" (still too
+# long once cut down) or "none_reviewable".
+_path_list_too_long = set()
+
+
+def _too_many_args(e):
+    """The OS refused to start the command because its arguments are too
+    long. Windows reports ERROR_FILENAME_EXCED_RANGE, which Python turns into
+    a FileNotFoundError."""
+    return e.errno == errno.E2BIG or getattr(e, "winerror", None) == 206
+
+
+def _run_captured(cmd, timeout, **kwargs):
+    return subprocess.run(cmd, capture_output=True, timeout=timeout, **kwargs)
+
+
+def _run_git_on_review_paths(args, paths, timeout, run=_run_captured, **kwargs):
+    """Run `git <args> -- <paths>` for the Stop review; return the results.
+    `run(cmd, timeout, **kwargs)` starts each command (_run_diff_bounded for
+    the diff, so its output is never held whole).
+
+    One command with every path whenever the OS takes it. When the OS refuses
+    the argument list as too long, only reviewable source paths are kept (the
+    review drops the rest from the diff anyway) and they go out in as few
+    commands as they need, all within `timeout` seconds together. If even
+    those need more than _MAX_PATH_BATCHES commands, the refusal is raised
+    again.
+
+    Secret-shaped paths that are gone from the work tree go into every one
+    of those commands: `git diff` must still pair a rename away from such a
+    name, or the secret's content would show as a new source file. A new file
+    that only resembles the secret may be paired with it too and left out of
+    the review. Any other rename is paired only when both of its paths are
+    reviewable source and in the same command; otherwise it shows as a delete
+    or an add.
+    """
+    cmd = [*GIT_CMD, *args, "--"]
+    paths = list(paths)
+    deadline = time.monotonic() + timeout
+    try:
+        return [run(cmd + paths, timeout, **kwargs)]
+    except OSError as e:
+        if not _too_many_args(e):
+            raise
+        too_long = e
+    budget = _path_args_budget(kwargs.get("env"))
+    batches = list(_path_batches(
+        [p for p in paths if _is_reviewable_source(p)], budget))
+    root = kwargs.get("cwd") or os.getcwd()
+    secret = [p for p in paths if _is_secret_shaped(p)
+              and not os.path.lexists(os.path.join(root, p))]
+    debug_log(f"git {args[0]}: {len(paths)} paths do not fit one command; "
+              f"{len(batches)} command(s) for the reviewable ones")
+    # The secret-shaped paths ride along with every batch, so they get a
+    # small share of a command of their own.
+    if (len(batches) > _MAX_PATH_BATCHES
+            or sum(map(_arg_cost, secret)) > budget // 4):
+        raise too_long
+    cmd += secret
+    results = []
+    for batch in batches:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        results.append(run(cmd + batch, left, **kwargs))
+    return results
 
 
 _TEMP_INDEX_PREFIX = "security_hook_idx_"
@@ -403,9 +547,11 @@ def _temp_index(cwd, untracked_paths=None):
     """Yield an env dict pointing GIT_INDEX_FILE at a throwaway copy of the
     repo's index with `git add --intent-to-add` applied, so untracked files
     show up in subsequent `git diff` calls without touching the user's real
-    index. Yields None if no index can be found (bare repo / not a repo) or
-    no copy slot came free; the caller should fall back to a plain diff.
-    Always cleans up the temp file.
+    index. The copy has no gitlink entry for a nested repository (see
+    _drop_gitlinks). Yields None if no index can be found (bare repo / not a
+    repo), no copy slot came free, or those entries could not be removed.
+    Callers then go on without the copy: the diff reads the real index, and
+    the baseline falls back to HEAD. Always cleans up the temp file.
 
     Perf: when `untracked_paths` is given, only those paths are added (O(n)
     in untracked count). The default `add -N .` stats every file in the
@@ -416,7 +562,7 @@ def _temp_index(cwd, untracked_paths=None):
     Cleanup removes `<tmp_index>*`, not just the copy: git writes
     `<index>.lock` and `<index>.stash.<pid>` next to the index it is given and
     cannot remove them itself when a subprocess timeout kills it."""
-    real_index = _find_git_index(cwd)
+    real_index, top = _find_git_index_and_top(cwd)
     if not real_index:
         yield None
         return
@@ -432,12 +578,12 @@ def _temp_index(cwd, untracked_paths=None):
             debug_log("no index copy slot came free; going without a copy")
             yield None
             return
-        with _copied_index(cwd, real_index, tmpdir, untracked_paths) as env:
+        with _copied_index(cwd, top, real_index, tmpdir, untracked_paths) as env:
             yield env
 
 
 @contextlib.contextmanager
-def _copied_index(cwd, real_index, tmpdir, untracked_paths):
+def _copied_index(cwd, top, real_index, tmpdir, untracked_paths):
     import shutil
     import tempfile
 
@@ -459,6 +605,12 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
         except (OSError, NotImplementedError, AttributeError):
             shutil.copy2(real_index, tmp_index)
         env = {**os.environ, "GIT_INDEX_FILE": tmp_index}
+        # Before `git add` runs, since add reads the gitlinks its paths cover.
+        if not _drop_gitlinks(top, env, tmp_index):
+            debug_log("could not remove gitlinks from the index copy; going on "
+                      "without the copy")
+            yield None
+            return
         if untracked_paths is None:
             add_args = ["."]
         elif untracked_paths:
@@ -472,7 +624,7 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
             surviving = [p for p in untracked_paths
                          if not p.endswith("/")
                          and os.path.lexists(os.path.join(cwd, p))]
-            add_args = ["--"] + surviving if surviving else None
+            add_args = surviving or None
         else:
             add_args = None
         if add_args:
@@ -480,15 +632,145 @@ def _copied_index(cwd, real_index, tmpdir, untracked_paths):
             # still spawns reader threads that decode stderr — git error
             # messages can reference non-ASCII filenames and crash on
             # cp1252. See #2099. Drop text=True so bytes stay raw.
-            subprocess.run(
-                [*GIT_CMD, "add", "--intent-to-add"] + add_args,
-                cwd=cwd, capture_output=True, timeout=10,
-                env=env,
-            )
+            _run_git_on_review_paths(
+                ["add", "--intent-to-add"], add_args, timeout=10, cwd=cwd,
+                # The paths are file names, not patterns, for this git add
+                # only: an untracked file named `:(glob)**` must add only
+                # itself.
+                env={**env, "GIT_LITERAL_PATHSPECS": "1"})
+            # A whole-tree add puts a nested repository back.
+            if untracked_paths is None and not _drop_gitlinks(top, env, tmp_index):
+                yield None
+                return
         yield env
     finally:
         _remove_copy(tmp_index)
         _live_copies.discard(tmp_index)
+
+
+# An index entry stores its mode as four bytes; this is a gitlink's.
+_GITLINK_MODE = b"\x00\x00\xe0\x00"
+# Signature of the index extension that says most entries are in a second,
+# shared file (core.splitIndex).
+_SPLIT_INDEX_EXT = b"link"
+
+
+def _may_have_gitlinks(index_path):
+    """False only when the index file at `index_path` cannot hold a gitlink
+    entry: neither a gitlink's mode bytes nor the split-index signature occur
+    anywhere in it. Either can occur by chance (in an object id, a file
+    size, a path), so True means "list the entries and see". Most
+    repositories have no gitlink, and for them this saves a git process on
+    every index copy."""
+    keep = max(len(_GITLINK_MODE), len(_SPLIT_INDEX_EXT)) - 1
+    try:
+        with open(index_path, "rb") as f:
+            tail = b""
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    return False
+                data = tail + chunk
+                if _GITLINK_MODE in data or _SPLIT_INDEX_EXT in data:
+                    return True
+                tail = data[-keep:]
+    except OSError:
+        return True
+
+
+_GITLINK_LIST_TIMEOUT = 10
+# `git ls-files --sparse` (git 2.35) lists a sparse index as it is stored;
+# without it git first expands the index to every path in the repository.
+# Set to False once this git has refused the option.
+_ls_files_sparse = True
+
+
+def _gitlink_paths(top, env):
+    """Paths (bytes, relative to `top`) of the gitlink entries, at any depth,
+    in the index `env` names. None if they could not be listed. The listing
+    is read as it comes, so a large index costs time but not memory."""
+    global _ls_files_sparse
+    cmd = [*GIT_CMD, "ls-files", "-s", "-z"] + (["--sparse"] if _ls_files_sparse else [])
+    p = subprocess.Popen(cmd, cwd=top, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env)
+    killer = threading.Timer(_GITLINK_LIST_TIMEOUT, p.kill)
+    killer.daemon = True
+    found = set()
+    tail = b""
+    try:
+        killer.start()
+        while True:
+            chunk = p.stdout.read1(65536)
+            if not chunk:
+                break
+            data = tail + chunk
+            end = data.rfind(b"\0") + 1
+            # "<mode> <object> <stage>\t<path>", NUL-terminated. Most chunks
+            # have no gitlink and are not split up.
+            if b"160000 " in data:
+                for rec in data[:end].split(b"\0"):
+                    if rec.startswith(b"160000 "):
+                        found.add(rec.split(b"\t", 1)[1])
+            tail = data[end:]
+        rc = p.wait()
+    finally:
+        killer.cancel()
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+        p.stdout.close()
+    if rc == 129 and _ls_files_sparse:
+        # Usage error: a git without --sparse.
+        _ls_files_sparse = False
+        return _gitlink_paths(top, env)
+    if rc != 0:
+        debug_log(f"git ls-files on the index copy failed (rc={rc})")
+        return None
+    return found
+
+
+def _drop_gitlinks(top, env, tmp_index):
+    """Remove the gitlink (mode 160000) entry of every nested repository from
+    the index copy that `env` names, never from the real index, before
+    anything else runs on the copy. A gitlink marks a directory that is, or
+    can be, another repository (see diff.ignoreSubmodules in GIT_CMD):
+    `git stash create` takes no flag like IGNORE_SUBMODULES, and `git add`
+    reads the gitlinks its paths cover. An entry whose directory has no
+    `.git` stays: git starts nothing there, and without the entry an older
+    `git stash create` fails on the empty directory. `top` is the work
+    tree's top directory. Returns True on success, False on any failure; the
+    copy must not be used then."""
+    try:
+        if not _may_have_gitlinks(tmp_index):
+            return True
+        gitlinks = _gitlink_paths(top, env)
+        if gitlinks is None:
+            return False
+        top_b = os.fsencode(top)
+        nested = sorted(p for p in gitlinks
+                        if os.path.lexists(os.path.join(top_b, p, b".git")))
+        if not nested:
+            return True
+        mtime_ns = os.stat(tmp_index).st_mtime_ns
+        # git writes a new file and renames it over the copy, so a copy that
+        # is a hard link to the real index leaves the real one as it was.
+        rm = subprocess.run(
+            [*GIT_CMD, "update-index", "--force-remove", "-z", "--stdin"],
+            cwd=top, input=b"".join(p + b"\0" for p in nested),
+            capture_output=True, timeout=10, env=env)
+        if rm.returncode != 0:
+            debug_log(f"git update-index on the index copy failed (rc={rm.returncode}): "
+                      f"{rm.stderr[:200].decode('utf-8', errors='replace')}")
+            return False
+        # Keep the mtime the copy came with; see _copied_index.
+        os.utime(tmp_index, ns=(mtime_ns, mtime_ns))
+        debug_log(f"gitlink entries (nested repositories) removed from the "
+                  f"index copy: {len(nested)}; their contents are not reviewed")
+        return True
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, ValueError) as e:
+        # RuntimeError: the timer thread could not start.
+        debug_log(f"removing gitlinks from the index copy failed: {e}")
+        return False
 
 
 def _git_toplevel(cwd):
@@ -1097,12 +1379,15 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
 
     If `paths` is given, the diff is restricted to those paths (relative to
     cwd; absolute paths are converted, paths outside cwd are dropped).
+    A path list too long for one command is cut down to reviewable source
+    files: see _run_git_on_review_paths.
     `untracked_paths` (repo-root-relative) is forwarded to _temp_index so it
     can add only those files instead of scanning the whole worktree.
     The output is read through _DiffKeeper: files the review would drop come
     back as their header line only, and a file's diff past
     MAX_FILE_DIFF_BYTES is cut down to its added lines.
     """
+    _path_list_too_long.clear()
     pathspec = _diff_pathspec(cwd, paths)
     if paths and not pathspec:
         # Caller restricted to specific paths but none are inside this repo
@@ -1112,25 +1397,36 @@ def get_git_diff(cwd, baseline_sha, full_context=False, paths=None, untracked_pa
         return ""
 
     # core.quotePath=false comes from GIT_CMD globally (see definition).
-    cmd = [*GIT_CMD, "diff", IGNORE_SUBMODULES, "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else []) + pathspec
+    args = ["diff", IGNORE_SUBMODULES, "--no-color", "--no-ext-diff", "--no-textconv", baseline_sha] + (["--unified=99999"] if full_context else [])
     _diff_read.update(bytes=0, cut_files=0, cut_bytes=0)
+
+    def _run(env):
+        if pathspec:
+            results = _run_git_on_review_paths(args, pathspec[1:], timeout=30, run=_run_diff_bounded, cwd=cwd, env=env)
+        else:
+            results = [_run_diff_bounded([*GIT_CMD, *args], 30, cwd=cwd, env=env)]
+        if not results:
+            _path_list_too_long.add("none_reviewable")
+        for result in results:
+            if result.returncode != 0:
+                debug_log(f"git diff failed: {result.stderr[:200].decode('utf-8', errors='replace')}")
+                return None
+        # Decode with errors='replace' so binary diffs don't crash
+        return b"".join(r.stdout for r in results).decode("utf-8", errors="replace")
+
     try:
         if untracked_paths is not None and not untracked_paths:
             # Nothing to `add -N`, and the diff only reads the index.
-            result = _run_diff_bounded(cmd, 30, cwd=cwd)
-        else:
-            with _temp_index(cwd, untracked_paths) as env:
-                # env is None when there is no index (bare repo / not a repo)
-                # or no copy slot — diff still runs, just without
-                # untracked-file support.
-                result = _run_diff_bounded(cmd, 30, cwd=cwd, env=env)
-        if result.returncode != 0:
-            debug_log(f"git diff failed: {result.stderr[:200].decode('utf-8', errors='replace')}")
-            return None
-        # Decode with errors='replace' so binary diffs don't crash
-        return result.stdout.decode("utf-8", errors="replace")
+            return _run(None)
+        with _temp_index(cwd, untracked_paths) as env:
+            # env is None when there is no index (bare repo / not a repo)
+            # or no copy slot — diff still runs, just without
+            # untracked-file support.
+            return _run(env)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         debug_log(f"git diff error: {e}")
+        if isinstance(e, OSError) and _too_many_args(e):
+            _path_list_too_long.add("gave_up")
         return None
 
 

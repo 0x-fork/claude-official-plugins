@@ -32,6 +32,11 @@ import urllib.parse
 import urllib.request
 from typing import Optional, Tuple, Dict, Any, List, Callable
 
+try:
+    import ssl
+except ImportError:  # a Python built without TLS
+    ssl = None
+
 import extensibility
 import review_api
 from _base import debug_log, _record_usage, _record_http_error, _PV, PROVENANCE_TAG, state_dir as _resolve_state_dir, agent_sdk_site_dirs  # noqa: F401
@@ -196,10 +201,91 @@ def _anthropic_base_url() -> str:
     return os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
 
 
+# ── Windows certificate store with an entry OpenSSL cannot read ──────────
+# Older Python releases (3.11 and 3.12 among them) hand each Windows
+# certificate store to OpenSSL in one call, so a single certificate it cannot
+# parse makes ssl.create_default_context() raise, and every HTTPS call fails
+# before a byte is sent. SSL_CERT_FILE does not help: the store is read
+# first. Newer releases load the store one certificate at a time and skip
+# the ones that fail; _urlopen does the same on the releases that do not.
+
+_STORE_TLS_UNSET = object()
+_store_tls_context = _STORE_TLS_UNSET  # None once Python's default context is known to build
+_store_tls_lock = threading.Lock()
+# Store entries left out of that context; emit_metrics reports it.
+_store_certs_skipped = 0
+
+
+def _context_without_unreadable_store_certs():
+    """(context, skipped): Python's default TLS context built from the
+    Windows store entries OpenSSL can parse, and how many it could not.
+    The context is None when the default one builds as it is, off Windows,
+    or when no entry is readable. Trust is never widened: the certificates
+    come from the same stores, under the same server-authentication filter,
+    and the chain and host name are verified as in any default context."""
+    enum_certificates = getattr(ssl, "enum_certificates", None)  # Windows only
+    if enum_certificates is None:
+        return None, 0
+    try:
+        ssl.create_default_context()
+        return None, 0
+    except ssl.SSLError:
+        pass
+    server_auth = ssl.Purpose.SERVER_AUTH.oid
+    context, skipped = None, 0
+    for store in getattr(ssl.SSLContext, "_windows_cert_stores", ("CA", "ROOT")):
+        try:
+            for cert, encoding, trust in enum_certificates(store):
+                if encoding != "x509_asn" or not (trust is True or server_auth in trust):
+                    continue
+                try:
+                    if context is None:
+                        # With cadata, create_default_context applies every
+                        # default except reading the store itself.
+                        context = ssl.create_default_context(cadata=cert)
+                    else:
+                        context.load_verify_locations(cadata=cert)
+                except ssl.SSLError:
+                    skipped += 1
+        except PermissionError:
+            pass
+    if context is None:
+        return None, skipped
+    context.set_default_verify_paths()
+    # What http.client sets on the context it would have made.
+    context.set_alpn_protocols(["http/1.1"])
+    if context.post_handshake_auth is not None:
+        context.post_handshake_auth = True
+    return context, skipped
+
+
+def _urlopen(request, timeout):
+    """urllib.request.urlopen for the plugin's API calls. Uses Python's
+    default TLS context unless that cannot be built because of the Windows
+    certificate store (see above); checked once per process."""
+    global _store_tls_context, _store_certs_skipped
+    if _store_tls_context is _STORE_TLS_UNSET:
+        with _store_tls_lock:
+            if _store_tls_context is _STORE_TLS_UNSET:
+                try:
+                    context, skipped = _context_without_unreadable_store_certs()
+                except Exception as e:
+                    debug_log(f"TLS: certificate store check failed: {type(e).__name__}")
+                    context, skipped = None, 0
+                if context is not None:
+                    debug_log(f"TLS: the Windows certificate store has {skipped} certificate(s) "
+                              "OpenSSL cannot read; using the store without them")
+                    _store_certs_skipped = skipped
+                _store_tls_context = context
+    if _store_tls_context is None:
+        return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout, context=_store_tls_context)
+
+
 def _probe_anthropic(timeout: float = 5.0) -> bool:
     req = urllib.request.Request(_anthropic_base_url() + "/", method="HEAD")
     try:
-        with urllib.request.urlopen(req, timeout=timeout):
+        with _urlopen(req, timeout):
             return True
     except urllib.error.HTTPError:
         return True  # got a status code → connected
@@ -484,9 +570,7 @@ def _fetch_newest_opus() -> Optional[str]:
             url, headers=_build_auth_headers(use_token, betas=()), method="GET",
         )
         try:
-            with urllib.request.urlopen(
-                request, timeout=_REVIEW_MODEL_LOOKUP_TIMEOUT,
-            ) as response:
+            with _urlopen(request, _REVIEW_MODEL_LOOKUP_TIMEOUT) as response:
                 listing = json.loads(
                     response.read(_REVIEW_MODEL_LISTING_MAX_BYTES).decode("utf-8")
                 )
@@ -975,7 +1059,7 @@ def _call_claude(prompt, output_schema, thinking_budget=10000, max_tokens=16000,
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with _urlopen(request, 120) as response:
                 response_body = response.read().decode("utf-8")
                 response_data = json.loads(response_body)
             _record_usage(response_data.get("usage") or {},
