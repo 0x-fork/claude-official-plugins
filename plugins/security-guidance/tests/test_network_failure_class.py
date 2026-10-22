@@ -217,6 +217,33 @@ class TestRecorded:
         assert llm.last_review_failed() and llm.last_review_status() is None
         assert _base._net_error_metric() == llm.NET_ERR_TLS
 
+    def test_failure_on_the_windows_store_context_is_recorded(self, direct, monkeypatch):
+        """The context built for a Windows store with an unreadable entry is
+        the one the call uses, and a failure on it is still classified."""
+        context = ssl.create_default_context()
+        monkeypatch.setattr(llm, "_store_tls_context", context)
+        used = []
+
+        def urlopen(*a, **k):
+            used.append(k.get("context"))
+            raise urllib.error.URLError(_cert_error(20))
+        monkeypatch.setattr(llm.urllib.request, "urlopen", urlopen)
+        assert llm._call_claude("p", {"type": "object"}, model="m") is None
+        assert used and all(c is context for c in used)
+        assert _base._net_error_metric() == 2001
+
+    def test_store_check_that_fails_is_recorded_as_tls(self, direct, monkeypatch):
+        """The store check raises and Python's own default context cannot be
+        built either: the call raises past the retry loop."""
+        def check():
+            raise ssl.SSLError(1, "[ASN1] nested asn1 error")
+        monkeypatch.setattr(llm, "_store_tls_context", llm._STORE_TLS_UNSET)
+        monkeypatch.setattr(llm, "_context_without_unreadable_store_certs", check)
+        self._urlopen(monkeypatch, ssl.SSLError(1, "[ASN1] nested asn1 error"))
+        assert llm.analyze_code_security([("a.py", "+x = 1\n")]) == (None, [])
+        assert llm.last_review_failed()
+        assert _base._net_error_metric() == llm.NET_ERR_TLS
+
     def test_reply_that_is_not_json_records_nothing(self, direct, monkeypatch):
         self._urlopen(monkeypatch, "<html>sign in</html>")
         assert llm.analyze_code_security([("a.py", "+x = 1\n")]) == (None, [])
