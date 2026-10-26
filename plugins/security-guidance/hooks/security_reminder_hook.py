@@ -220,18 +220,34 @@ CONTINUATION_SUFFIX = (
 # Extra keys emit_metrics appends to every row this invocation emits.
 _TAIL_METRICS: Dict[str, Any] = {}
 
-# The launcher's slow interpreter probes, if any. After everything else.
+# The launcher's slow interpreter probes, if any. After the keys above.
 _LAUNCHER_METRICS: Dict[str, Any] = launcher_probe_metrics()
 
 # Reviewer context diagnostics from llm.agentic_review, most useful first.
 _REVIEWER_CONTEXT_KEYS = ("rv_cwd_gone", "rv_tool_err", "rv_tool_calls")
+# How much work the agentic reviewer did, from llm.agentic_review: turns, and
+# time waiting on the model. They tell more turns from slower turns when
+# review_ms moves.
+_REVIEWER_EFFORT_KEYS = ("rv_turns", "rv_api_ms")
+# A clean commit review row has one free key under CC's key cap once
+# rv_tool_calls is on it, so the two are sent as one number:
+#   rv_effort = rv_turns * _EFFORT_TURNS_UNIT + rv_api_ms (capped below the unit)
+_EFFORT_TURNS_UNIT = 10_000_000
+# The packed value queued for this row. Emitted after every other key, the
+# launcher's included, so it never displaces one at the cap.
+_REVIEWER_EFFORT_METRICS: Dict[str, Any] = {}
 
 
 def _note_reviewer_context(agentic_metrics):
-    """Queue the agentic reviewer's context diagnostics for this row."""
+    """Queue the agentic reviewer's context and effort diagnostics for this row."""
     for key in _REVIEWER_CONTEXT_KEYS:
         if agentic_metrics.get(key):
             _TAIL_METRICS[key] = agentic_metrics[key]
+    turns = agentic_metrics.get("rv_turns") or 0
+    api_ms = agentic_metrics.get("rv_api_ms") or 0
+    if turns or api_ms:
+        _REVIEWER_EFFORT_METRICS["rv_effort"] = (
+            turns * _EFFORT_TURNS_UNIT + min(api_ms, _EFFORT_TURNS_UNIT - 1))
 
 
 def emit_metrics(
@@ -325,6 +341,7 @@ def emit_metrics(
         tail["strict_mcp_off"] = 1
     tail.update(_TAIL_METRICS)
     tail.update(_LAUNCHER_METRICS)
+    tail.update(_REVIEWER_EFFORT_METRICS)
     metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}
     if rewake_summary:
@@ -1284,10 +1301,11 @@ def _agentic_review_with_race(
     _th.Thread(target=_fallback, daemon=True).start()
 
     winner, (g, v, m) = q.get()
-    # What the agentic run saw of its directory is kept when the fallback's
-    # result replaces it below.
+    # What the agentic run saw of its directory, and how much work it did,
+    # is kept when the fallback's result replaces it below.
     reviewer_context = (
-        {k: m[k] for k in _REVIEWER_CONTEXT_KEYS if k in m} if winner == "agentic" else {}
+        {k: m[k] for k in _REVIEWER_CONTEXT_KEYS + _REVIEWER_EFFORT_KEYS if k in m}
+        if winner == "agentic" else {}
     )
     if winner == "agentic" and m.get("agentic_fallback") and fallback_started.is_set():
         # The caller would rerun the single-shot review the fallback has

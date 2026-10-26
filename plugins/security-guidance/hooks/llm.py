@@ -1791,11 +1791,15 @@ def agentic_review(
                      before the review, 2 = it went missing during it
       rv_tool_err    Read/Grep/Glob calls that came back as errors
       rv_tool_calls  Read/Grep/Glob calls made
+      rv_turns       turns the reviewer took, as the CLI counts them
+      rv_api_ms      time the reviewer spent waiting on the model, in ms
 
-    The counts cover all stages of the review. Keys are left out when 0."""
+    The counts cover all stages of the review. Keys are left out when 0.
+    rv_turns and rv_api_ms come from each stage's result message, so a stage
+    that ends without one (the CLI exits early) adds nothing to them."""
     context_dir = _agentic_context_dir(repo_dir)
     gone = 0 if os.path.isdir(context_dir) else 1
-    ctx = {"rv_tool_err": 0, "rv_tool_calls": 0}
+    ctx = {"rv_tool_err": 0, "rv_tool_calls": 0, "rv_turns": 0, "rv_api_ms": 0}
     guidance, vulns, metrics = _agentic_review(repo_dir, diff_files, touched_paths, ctx)
     if not gone and not os.path.isdir(context_dir):
         gone = 2
@@ -2012,6 +2016,13 @@ def _agentic_review(
                 # the price-table estimate. getattr guards older SDK builds.
                 _record_usage(getattr(msg, "usage", None) or {}, model,
                               cost_usd=getattr(msg, "total_cost_usd", None))
+                for key, attr in (("rv_turns", "num_turns"), ("rv_api_ms", "duration_api_ms")):
+                    value = getattr(msg, attr, None)
+                    # Counting must never fail the review: anything that
+                    # is not a positive finite number adds nothing.
+                    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                            and 0 < value < float("inf")):
+                        ctx[key] += int(value)
             else:
                 # Tool results come back as user messages.
                 content = getattr(msg, "content", None)
