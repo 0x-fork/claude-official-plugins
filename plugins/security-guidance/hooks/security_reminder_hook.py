@@ -84,10 +84,10 @@ from _base import (  # noqa: E402,F401
     DEBUG_LOG_FILE, DEBUG_LOG_MAX_BYTES, debug_log,
     PROVENANCE_TAG, PROVENANCE_BANNER,
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
-    _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
+    _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics, _net_error_metric,
     _USAGE_CONTEXT, _log_usage,
     launcher_probe_metrics, state_dir as _resolve_state_dir,
-    write_hook_output as _write_hook_output,
+    write_hook_output as _write_hook_output, portable_output,
     llm_reviews_switched_off, agent_sdk_installed,
 )
 import extensibility  # noqa: E402
@@ -103,6 +103,7 @@ from session_state import (  # noqa: E402,F401
 )
 from gitutil import (  # noqa: E402,F401
     GIT_CMD, apply_safe_git_env, remove_copies_on_termination,
+    on_windows_drive,
     _git_rev_parse_head, _find_git_index, _diff_pathspec, _temp_index,
     _git_toplevel, _git_dir, _git_rev_list_range, _git_diff_range,
     _git_toplevel_and_head, _git_head_at,
@@ -124,6 +125,7 @@ from diffstate import (  # noqa: E402,F401
     _REVIEWED_SHAS_BASENAME, _REVIEWED_SHAS_CAP,
     _reviewed_shas_path, _load_reviewed_shas, _append_reviewed_shas,
     _full_shas, _mark_inflight, _load_inflight_shas, _reviewed_after_inflight,
+    _diff_review_started, _diff_review_done,
     UNTRACKED_BASELINE_CAP, _list_untracked, compute_v2_review_set,
     touched_scope, review_scope_code,
     baseline_origin, baseline_origin_metric, FOREIGN_ORIGINS,
@@ -219,6 +221,10 @@ CONTINUATION_SUFFIX = (
 
 # Extra keys emit_metrics appends to every row this invocation emits.
 _TAIL_METRICS: Dict[str, Any] = {}
+# Of those, the ones that go after the others whenever they were set: a row
+# over CC's key cap loses them before any older review key. Only the launcher
+# keys below come later; those are also on every smaller row of the session.
+_LAST_METRIC_KEYS = ("diff_seen",)
 
 # The launcher's slow interpreter probes, if any. After everything else.
 _LAUNCHER_METRICS: Dict[str, Any] = launcher_probe_metrics()
@@ -304,6 +310,12 @@ def emit_metrics(
         head["launcher_fallback"] = 1
     usage = _usage_metrics()
     head.update(usage)
+    # Why the last call got no HTTP response (api_error -1 says only that it
+    # did not). Ahead of the row's own keys: on a failed review this is the
+    # key that says what failed, so it is not the one to lose to the key cap.
+    net_err = _net_error_metric()
+    if net_err:
+        head["net_err"] = net_err
     if head:
         metrics = {**head, **metrics}
     # Diagnostic keys go last, so they are the first dropped when a row is
@@ -324,6 +336,9 @@ def emit_metrics(
         # managed-mcp.json) and the review was started again without it.
         tail["strict_mcp_off"] = 1
     tail.update(_TAIL_METRICS)
+    for k in _LAST_METRIC_KEYS:
+        if k in tail:
+            tail[k] = tail.pop(k)
     tail.update(_LAUNCHER_METRICS)
     metrics = {**metrics, **{k: v for k, v in tail.items() if k not in metrics}}
     out = {"metrics": metrics}
@@ -680,6 +695,31 @@ def _store_baseline_fail(state, fail):
         state.pop("baseline_fail", None)
 
 
+# A prompt waits for this hook, so one this slow is worth a metrics row. Faster
+# prompts send none: the row would be one more event per prompt for every user.
+SLOW_PROMPT_MS = 1000
+
+
+def _slow_prompt_metrics(cwd, total, baseline, untracked, captured, baseline_fail):
+    """The metrics row for a slow prompt. Times are seconds, spent in
+    handle_user_prompt_submit (the launcher reports its own). Counts and flags
+    only, never a path. Telemetry only."""
+    metrics = {
+        "ups_ms": int(total * 1000),
+        "ups_baseline_ms": int(baseline * 1000),
+        "ups_untracked_ms": int(untracked * 1000),
+    }
+    if diffstate.last_index_entries is not None:
+        metrics["ups_index_entries"] = diffstate.last_index_entries
+    if on_windows_drive(cwd):
+        metrics["ups_wsl_drive"] = 1
+    if not captured:
+        metrics["ups_no_baseline"] = 1
+    if baseline_fail:
+        metrics["ups_baseline_fail"] = baseline_fail
+    return metrics
+
+
 def handle_user_prompt_submit(input_data):
     """
     Handle UserPromptSubmit — capture git baseline SHA.
@@ -692,6 +732,8 @@ def handle_user_prompt_submit(input_data):
     to be lost when the wipe landed before Stop's state read.
 
     """
+    import time as _time
+    started = _time.monotonic()
     cwd = input_data.get("cwd", "")
     if not cwd:
         debug_log("UPS: no cwd, skipping baseline capture")
@@ -704,17 +746,25 @@ def handle_user_prompt_submit(input_data):
     # nothing, so only the stash baseline (still read by the Write pattern
     # filter) is captured.
     snapshot_untracked = ENABLE_STOP_REVIEW and ENABLE_CODE_SECURITY_REVIEW
+    spent = {"baseline": 0.0, "untracked": 0.0}
+
+    def _timed(key, fn, repo_cwd):
+        began = _time.monotonic()
+        try:
+            return fn(repo_cwd)
+        finally:
+            spent[key] += _time.monotonic() - began
 
     def _capture(repo_cwd):
         if not snapshot_untracked:
-            return capture_git_baseline(repo_cwd), None
+            return _timed("baseline", capture_git_baseline, repo_cwd), None
         # stash-create and ls-files both walk the worktree (~2-5s each in a
         # very large repo). Run them concurrently so UPS latency stays
         # ≈ max(both).
         import concurrent.futures as _cf
         with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-            _f_sha = _ex.submit(capture_git_baseline, repo_cwd)
-            _f_ut = _ex.submit(_list_untracked, repo_cwd)
+            _f_sha = _ex.submit(_timed, "baseline", capture_git_baseline, repo_cwd)
+            _f_ut = _ex.submit(_timed, "untracked", _list_untracked, repo_cwd)
             # Taken whether or not the stash produced a SHA. `git stash
             # create` returns empty when there are no TRACKED changes, but
             # pre-existing untracked files still need to be excluded from the
@@ -723,7 +773,6 @@ def handle_user_prompt_submit(input_data):
             # something tracked is dirtied.
             return _f_sha.result(), _f_ut.result() or {}
 
-    import time as _time
     captured_at = _time.time()
     sha, untracked_now = _capture(cwd)
     # No repo here and none remembered: the listing above failed, it did not
@@ -812,6 +861,13 @@ def handle_user_prompt_submit(input_data):
         # invocation failure. See #2099.
         debug_log(f"Failed to capture git baseline (cwd={cwd!r}) — not a git repo, "
                   f"or git invocation failed (check log entries above)")
+
+    total = _time.monotonic() - started
+    debug_log(f"UPS: took {total:.2f}s (baseline {spent['baseline']:.2f}s, "
+              f"untracked {spent['untracked']:.2f}s)")
+    if (total * 1000 >= SLOW_PROMPT_MS or _LAUNCHER_METRICS) and not portable_output():
+        emit_metrics(_slow_prompt_metrics(
+            cwd, total, spent["baseline"], spent["untracked"], bool(sha), baseline_fail))
 
     sys.exit(0)
 
@@ -1760,6 +1816,10 @@ def handle_commit_review_posttooluse(input_data):
     # Tell a push review (or the next commit's reflog scan) that these commits
     # are being reviewed, so it does not start a second review of them.
     _mark_inflight(repo_root, _full_shas(repo_root, shas))
+    # Count only: keyed on what the reviewer is sent, after the byte caps.
+    _diff_token, _seen_m = _diff_review_started(
+        repo_root, _cap_files_for_prompt(diff_files), tip=shas[0])
+    _TAIL_METRICS.update(_seen_m)
 
     review_start = _time.time()
 
@@ -1863,6 +1923,7 @@ def handle_commit_review_posttooluse(input_data):
         _append_reviewed_shas(repo_root, full_shas, vulns_found=len(vulns or []))
     except Exception:
         pass
+    _diff_review_done(_diff_token)
 
     if not concrete_guidance:
         debug_log("Commit review: no security issues found")
@@ -2190,6 +2251,9 @@ def handle_push_sweep_posttooluse(input_data):
         sys.exit(0)
 
     _mark_inflight(repo_root, tail)
+    _diff_token, _seen_m = _diff_review_started(
+        repo_root, _cap_files_for_prompt(diff_files))
+    _TAIL_METRICS.update(_seen_m)
 
     import time as _time
     now = _time.time()
@@ -2235,6 +2299,7 @@ def handle_push_sweep_posttooluse(input_data):
 
     # The tail is now covered by this net-diff review.
     _append_reviewed_shas(repo_root, tail, vulns_found=len(vulns or []))
+    _diff_review_done(_diff_token)
 
     new_vulns, n_deduped = _dedup_against_state(
         session_id, vulns or [], prompted=_finding_keys(previous_findings)
@@ -2547,9 +2612,11 @@ def handle_stop_hook(input_data):
         debug_log(f"Stop hook: diff against {content_base[:12]} failed — falling back to {diff_base}")
         diff_output = get_git_diff(repo_root, diff_base, full_context=False,
                                    paths=review_paths, untracked_paths=untracked)
-    # Only when it happened: MiB of git diff output read, reviewable files
-    # whose diff was cut while reading it, diffs that hit the timeout.
-    for _k, _v in (("diff_mb", gitutil._diff_read["bytes"] >> 20),
+    # Only when it happened: a failed `git add -N` (first, so a row at CC's key
+    # cap keeps it), MiB of git diff output read, reviewable files whose diff
+    # was cut while reading it, diffs that hit the timeout.
+    for _k, _v in (("add_fail", gitutil._add_failed["code"]),
+                   ("diff_mb", gitutil._diff_read["bytes"] >> 20),
                    ("diff_cut_files", gitutil._diff_read["cut_files"]),
                    ("diff_timeout", gitutil._diff_read["timeouts"])):
         if _v:

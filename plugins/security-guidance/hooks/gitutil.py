@@ -103,6 +103,50 @@ def apply_safe_git_env():
     os.environ.update(SAFE_GIT_ENV)
 
 
+def index_entry_count(path):
+    """The entry count in an index file's header (signature, version, count),
+    or None if it cannot be read. A split or sparse index holds fewer entries
+    than the repository has tracked files."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+    except OSError:
+        return None
+    if header[:4] == b"DIRC" and len(header) == 12:
+        return int.from_bytes(header[8:12], "big")
+    return None
+
+
+def windows_drive_mount(path, mountinfo):
+    """Whether `path` is on a Windows drive mounted into WSL, given the text
+    of /proc/self/mountinfo. Every file status there is a round trip to the
+    Windows host."""
+    best, best_type = "", ""
+    for line in mountinfo.splitlines():
+        # id parent dev root mountpoint options [tags] - fstype source options
+        before, _, after = line.partition(" - ")
+        fields, tail = before.split(), after.split()
+        if len(fields) < 5 or not tail:
+            continue
+        point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+        inside = path == point or path.startswith(point.rstrip("/") + "/")
+        if inside and len(point) >= len(best):
+            best, best_type = point, tail[0]
+    return best_type in ("9p", "drvfs", "virtiofs")
+
+
+def on_windows_drive(path):
+    """windows_drive_mount for this machine. False anywhere but WSL."""
+    try:
+        with open("/proc/sys/kernel/osrelease") as f:
+            if "microsoft" not in f.read().lower():
+                return False
+        with open("/proc/self/mountinfo") as f:
+            return windows_drive_mount(os.path.realpath(path), f.read())
+    except (OSError, ValueError):
+        return False
+
+
 def _git_rev_parse_head(cwd):
     """Return the current HEAD SHA, or None if not a git repo / no commits."""
     try:
@@ -248,6 +292,15 @@ def _path_batches(paths, budget=None):
 # without a diff, for the Stop review's skip reason: "gave_up" (still too
 # long once cut down) or "none_reviewable".
 _path_list_too_long = set()
+
+# A failed `git add --intent-to-add` during this hook run, for the Stop hook's
+# metrics: kind * 100000 + the paths the add was given. One number because a
+# review row is near CC's key cap. A failed add leaves the new files out of the
+# diff, so a turn that only added files looks like a turn with no changes; a
+# timeout loses the whole diff. kind: 1 git could not write the empty blob to
+# the object store, 2 any other git error, 3 timeout. A git that speaks another
+# language counts as 2.
+_add_failed = {"code": 0}
 
 
 def _too_many_args(e):
@@ -542,6 +595,10 @@ def _hook_tmpdir():
     return d
 
 
+def _note_add_failure(kind, paths):
+    _add_failed["code"] = kind * 100000 + min(len(paths), 99999)
+
+
 @contextlib.contextmanager
 def _temp_index(cwd, untracked_paths=None):
     """Yield an env dict pointing GIT_INDEX_FILE at a throwaway copy of the
@@ -632,12 +689,20 @@ def _copied_index(cwd, top, real_index, tmpdir, untracked_paths):
             # still spawns reader threads that decode stderr — git error
             # messages can reference non-ASCII filenames and crash on
             # cp1252. See #2099. Drop text=True so bytes stay raw.
-            _run_git_on_review_paths(
-                ["add", "--intent-to-add"], add_args, timeout=10, cwd=cwd,
-                # The paths are file names, not patterns, for this git add
-                # only: an untracked file named `:(glob)**` must add only
-                # itself.
-                env={**env, "GIT_LITERAL_PATHSPECS": "1"})
+            try:
+                results = _run_git_on_review_paths(
+                    ["add", "--intent-to-add"], add_args, timeout=10, cwd=cwd,
+                    # The paths are file names, not patterns, for this git add
+                    # only: an untracked file named `:(glob)**` must add only
+                    # itself.
+                    env={**env, "GIT_LITERAL_PATHSPECS": "1"})
+            except subprocess.TimeoutExpired:
+                _note_add_failure(3, add_args)
+                raise
+            failed = next((r for r in results if r.returncode != 0), None)
+            if failed:
+                _note_add_failure(1 if b"empty blob" in failed.stderr else 2, add_args)
+                debug_log(f"git add -N failed: {failed.stderr[:200].decode('utf-8', errors='replace')}")
             # A whole-tree add puts a nested repository back.
             if untracked_paths is None and not _drop_gitlinks(top, env, tmp_index):
                 yield None
